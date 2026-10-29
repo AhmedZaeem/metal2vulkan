@@ -2191,6 +2191,22 @@ impl Device {
             }
             _ => false,
         };
+        if class.is_some() && !device_copy && !in_place::checking() {
+            let texels_count = u64::from(layout.extent[0]) * u64::from(layout.extent[1]);
+            static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            if texels_count >= 1 << 18 {
+                let line = format!(
+                    "m2v no device copy {:?} {:?} rows {} usage {:?}: {}",
+                    plan.format, layout.extent, texels.layout.row_pitch, usage, texels.device_copy_why(self)
+                );
+                if let Ok(mut said) = SAID.lock() {
+                    if said.len() < 300 && !said.contains(&line) {
+                        eprintln!("{line}");
+                        said.push(line);
+                    }
+                }
+            }
+        }
         let why = match class {
             Some(_) if device_copy => String::new(),
             Some(class) => {
@@ -2225,7 +2241,12 @@ impl Device {
                         true => Verdict::Passed,
                         false => self.in_place_verdict(class),
                     };
-                    match in_place::in_place(policy, usage, class, verdict) {
+                    // A render target over the pages renders in place where the device renders a
+                    // linear image of its format as a color attachment (`in_place_rendering`).
+                    let renders_linear =
+                        facts.linear(plan.format).contains(FormatFeatureFlags2::COLOR_ATTACHMENT);
+                    match in_place::in_place_rendering(policy, usage, class, verdict, renders_linear)
+                    {
                         Ok(()) => {
                             match self.in_place_image(&plan, descriptor, &texels, class, &facts)? {
                                 Ok((image, pitched)) => {
@@ -2234,7 +2255,23 @@ impl Device {
                                     }
                                     return Ok(Storage::Alias { image, texels });
                                 }
-                                Err((refusal, why)) => ShadowCause::Refused(refusal, why),
+                                Err((refusal, why)) => {
+                                    static SAID: std::sync::Mutex<Vec<String>> =
+                                        std::sync::Mutex::new(Vec::new());
+                                    if u64::from(layout.extent[0]) * u64::from(layout.extent[1]) >= 1 << 18 {
+                                        let line = format!(
+                                            "m2v in place refused ({refusal:?}) {:?} {:?} rows {} usage {:?}",
+                                            plan.format, layout.extent, texels.layout.row_pitch, usage
+                                        );
+                                        if let Ok(mut said) = SAID.lock() {
+                                            if said.len() < 300 && !said.contains(&line) {
+                                                eprintln!("{line}");
+                                                said.push(line);
+                                            }
+                                        }
+                                    }
+                                    ShadowCause::Refused(refusal, why)
+                                }
                             }
                         }
                         Err(cause) => cause,

@@ -551,6 +551,7 @@ impl Device {
         let imported = match imported {
             // An import the device and the gate admitted that then failed: a copy, announced.
             Err(error) if copyable && copies_after(&error) => {
+                eprintln!("m2v import by pointer failed ({call}, {length:#x} bytes at {pointer:p}): {error:?}");
                 let copy = (call, pointer, length, modes, placement, of_heap);
                 // SAFETY: the caller's contract.
                 return unsafe { self.copied_buffer(copy, release, dirty, Some(error)) };
@@ -1482,8 +1483,13 @@ impl Device {
         let imported = view.as_ref().map_or(start, ReadOnlyView::pointer);
         // SAFETY: the imported pages are host memory aligned to the import alignment (the
         // window's).
-        let types =
-            unsafe { importer.memory_types(raw_device, imported) }.map_err(import_refused)?;
+        let types = match unsafe { importer.memory_types(raw_device, imported) } {
+            Ok(types) => types,
+            Err(e) => {
+                eprintln!("m2v import: memory_types({imported:p}) failed: {e:?}");
+                return Err(import_refused(e));
+            }
+        };
         let allowed = types & requirements.memory_type_bits;
         // An allocation past the device's, refused before the driver sees it.
         let largest = self

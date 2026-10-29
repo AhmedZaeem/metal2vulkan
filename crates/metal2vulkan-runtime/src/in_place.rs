@@ -248,10 +248,26 @@ pub(crate) fn in_place(
     class: PagesClass,
     verdict: impl FnOnce(PagesClass) -> Verdict,
 ) -> Result<(), ShadowCause> {
+    in_place_rendering(policy, usage, class, verdict, false)
+}
+
+/// [`in_place`], where a render target is tried as an image in place too when `renders_linear`:
+/// the device renders a linear image of the texture's format as a color attachment
+/// (`ImageFacts::linear`, `VK_NV_linear_color_attachment`'s rule kept by `linear_attachment.rs`),
+/// so a pass renders into the pages themselves rather than into a shadow copied in whole for
+/// every command buffer and merged back after it. The device's check of the class covers such an
+/// image's first move (`in_place_check.rs`, its render-target rounds).
+pub(crate) fn in_place_rendering(
+    policy: HostPageTexturePolicy,
+    usage: TextureUsage,
+    class: PagesClass,
+    verdict: impl FnOnce(PagesClass) -> Verdict,
+    renders_linear: bool,
+) -> Result<(), ShadowCause> {
     if policy == HostPageTexturePolicy::Shadow {
         return Err(ShadowCause::Exact);
     }
-    if usage.contains(TextureUsage::RENDER_TARGET) {
+    if usage.contains(TextureUsage::RENDER_TARGET) && !renders_linear {
         return Err(ShadowCause::RenderTarget);
     }
     if usage.intersects(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC) {
@@ -367,7 +383,7 @@ impl InPlaceChecks {
 /// The version of what the check does and of how a record of it is named and framed: a change to
 /// either bumps it, and a record of another version is never read (its name differs, and so does
 /// the version it holds).
-pub(crate) const CHECK_VERSION: u32 = 1;
+pub(crate) const CHECK_VERSION: u32 = 2;
 
 /// A record's first bytes.
 const MAGIC: [u8; 8] = *b"M2VINPL\0";

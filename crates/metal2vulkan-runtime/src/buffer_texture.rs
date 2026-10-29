@@ -1381,6 +1381,20 @@ impl Texels {
             && (self.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some())
     }
 
+    /// Each condition of [`device_copy`](Self::device_copy), in words (a diagnostic).
+    pub(super) fn device_copy_why(&self, device: &Device) -> String {
+        let layout = &self.layout;
+        format!(
+            "discrete {} tracked {} one slice {} rows apart {} offset aligned {} logged pages {}",
+            device.properties().kind == crate::DeviceKind::Discrete,
+            self.tracked(),
+            layout.slices == 1,
+            layout.shared_bytes() == 0,
+            (self.buffer.at_for(layout.offset, ReadApart::Texture).1).is_multiple_of(self.texel_bytes),
+            (self.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some()),
+        )
+    }
+
     pub(super) fn shadow_copies(
         &self,
         image: vk::Image,

@@ -1936,7 +1936,10 @@ unsafe fn import_pointer(
         // allows the pointer; the caller's contract keeps the memory mapped.
         match unsafe { crate::creation::allocate_memory(device, &info) } {
             Ok(memory) => return Ok((memory, type_index)),
-            Err(error) => failure = ImportFailure::Vulkan(error),
+            Err(error) => {
+                eprintln!("m2v import: vkAllocateMemory type {type_index}, {size:#x} bytes at {:p}, device address {device_address}: {error:?}", pointer);
+                failure = ImportFailure::Vulkan(error)
+            }
         }
     }
     Err(failure)

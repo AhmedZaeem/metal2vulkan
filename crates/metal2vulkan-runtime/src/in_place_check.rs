@@ -175,17 +175,27 @@ fn run(weak: crate::device::WeakDevice) {
 fn check_class(device: &Device, class: PagesClass) -> Option<Verdict> {
     let page = host_page();
     let Some(pages) = ClassPages::make(device, class, BUFFER_BYTES) else {
+        eprintln!("m2v in-place check: {class:?}: its pages were not made");
         return Some(Verdict::Unchecked);
     };
+    eprintln!("m2v in-place check: {class:?}: pages made, checking shapes");
     let mut made = 0;
-    for shape in SHAPES {
+    // Each shape as a texture that only samples, then as a render target: a render target over
+    // host pages takes the image in place where the device renders a linear image of its format
+    // (`in_place::in_place_rendering`), so its first move is checked too. A shape whose render
+    // target takes no image in place makes none, which is no failure.
+    let usages = [
+        TextureUsage::SHADER_READ,
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    ];
+    for (shape, usage) in SHAPES.into_iter().flat_map(|s| usages.map(move |u| (s, u))) {
         if shape.window(page) > BUFFER_BYTES {
             continue;
         }
         for round in 0..ROUNDS {
             let outcome = {
                 let _busy = exit_guard::enter()?;
-                check_round(&pages, shape, round, page)
+                check_round(&pages, shape, round, page, usage)
             };
             match outcome {
                 Round::Kept => made += 1,
@@ -228,7 +238,13 @@ enum Round {
 
 /// One round of `shape` over `pages`, inside the caller's section: the pattern, the texture, the
 /// writes beside its image's first move, and the bytes compared.
-fn check_round(pages: &ClassPages, shape: Shape, round: usize, page: u64) -> Round {
+fn check_round(
+    pages: &ClassPages,
+    shape: Shape,
+    round: usize,
+    page: u64,
+    usage: TextureUsage,
+) -> Round {
     let window = shape.window(page);
     let bytes = Bytes {
         start: pages.start,
@@ -238,12 +254,16 @@ fn check_round(pages: &ClassPages, shape: Shape, round: usize, page: u64) -> Rou
     bytes.fill(&pattern);
     let mut descriptor =
         TextureDescriptor::texture_2d(shape.format, shape.width, shape.height, false);
-    descriptor.usage = TextureUsage::SHADER_READ;
-    let Ok(texture) = pages
-        .buffer
-        .new_texture(&descriptor, 0, shape.bytes_per_row)
-    else {
-        return Round::NotMade;
+    descriptor.usage = usage;
+    let texture = match pages.buffer.new_texture(&descriptor, 0, shape.bytes_per_row) {
+        Ok(texture) => texture,
+        Err(e) => {
+            eprintln!(
+                "m2v in-place check: {:?} {}x{} rows {}: new_texture failed: {e:?}",
+                shape.format, shape.width, shape.height, shape.bytes_per_row
+            );
+            return Round::NotMade;
+        }
     };
     let stop = AtomicBool::new(false);
     let started = Barrier::new(2);
@@ -262,6 +282,10 @@ fn check_round(pages: &ClassPages, shape: Shape, round: usize, page: u64) -> Rou
         settled
     });
     let Some(Ok(())) = settled else {
+        eprintln!(
+            "m2v in-place check: {:?} {}x{} rows {}: the first move did not settle: {settled:?}",
+            shape.format, shape.width, shape.height, shape.bytes_per_row
+        );
         return Round::NotMade;
     };
     drop(texture);
@@ -281,12 +305,22 @@ impl ClassPages {
     /// A buffer of `length` bytes in pages of `class` on `device`, where the device makes one
     /// there; inside a section of its own.
     fn make(device: &Device, class: PagesClass, length: u64) -> Option<ClassPages> {
-        let _busy = exit_guard::enter()?;
+        let Some(_busy) = exit_guard::enter() else {
+            eprintln!("m2v in-place check: {class:?}: the exit guard refused a section");
+            return None;
+        };
         match class {
             PagesClass::Pointer => pointer_pages(device, length),
             PagesClass::Fresh => {
-                let buffer = device.new_buffer(length, ResourceOptions::shared()).ok()?;
+                let buffer = match device.new_buffer(length, ResourceOptions::shared()) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        eprintln!("m2v in-place check: Fresh: new_buffer failed: {e:?}");
+                        return None;
+                    }
+                };
                 if !buffer.in_fresh_pages() {
+                    eprintln!("m2v in-place check: Fresh: the buffer is not in fresh pages");
                     return None;
                 }
                 let start = buffer.contents()?;
@@ -302,13 +336,24 @@ impl ClassPages {
 /// does not import the pointer (dma-bufs, or a copied host buffer, `copied.rs`).
 #[cfg(unix)]
 fn pointer_pages(device: &Device, length: u64) -> Option<ClassPages> {
-    let start = map_anonymous(length)?;
+    let Some(start) = map_anonymous(length) else {
+        eprintln!("m2v in-place check: Pointer: map_anonymous failed");
+        return None;
+    };
     let pages: crate::KeepAlive = Box::new(Anonymous { start, length });
     // SAFETY: the pages are this process's private anonymous mapping, readable and writable,
     // which stays until the keep-alive unmaps it, and which nothing else maps or frees.
     let memory = unsafe { HostMemory::new(start) };
-    let buffer = no_copy_kept(device, memory, length, pages)?;
+    let Some(buffer) = no_copy_kept(device, memory, length, pages) else {
+        eprintln!("m2v in-place check: Pointer: the no-copy buffer was refused");
+        return None;
+    };
     if buffer.over_dma_buf() || buffer.copied() {
+        eprintln!(
+            "m2v in-place check: Pointer: imported over a dma-buf {} / copied {}",
+            buffer.over_dma_buf(),
+            buffer.copied()
+        );
         return None;
     }
     Some(ClassPages { buffer, start })
@@ -331,7 +376,13 @@ fn no_copy_kept(
         keep_alive: Some(pages),
     };
     let descriptor = BufferDescriptor::new(length, ResourceOptions::shared(), contents);
-    device.new_buffer_with_descriptor(descriptor).ok()
+    match device.new_buffer_with_descriptor(descriptor) {
+        Ok(buffer) => Some(buffer),
+        Err(e) => {
+            eprintln!("m2v in-place check: new_buffer_with_descriptor failed: {e:?}");
+            None
+        }
+    }
 }
 
 /// Anonymous pages [`map_anonymous`] mapped, unmapped as this goes: a check buffer's keep-alive.
