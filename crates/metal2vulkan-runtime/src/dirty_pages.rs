@@ -46,6 +46,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 /// One publication of a [`DirtyPages`] source's log, in the order the source publishes them,
 /// which every source over the same host bytes shares: a later publication's stamp is larger.
@@ -127,6 +128,18 @@ pub trait DirtyPages: Send + Sync {
         self.wait(stamp)
     }
 
+    /// How long the runtime may hold a command buffer's submission for the publication of the
+    /// stamp its gated copies in sync to, where a hold would let them copy only the rows changed
+    /// (about the bound a publication takes, 4 ms for a VMM that flushes its vCPUs' logs): the
+    /// scheduler holds that command buffer alone, its queue's later work and the work that
+    /// conflicts with it behind it, asking [`published`](Self::published) about every half
+    /// millisecond, and submits it at the bound whatever the answer (every row then). Only for a
+    /// source whose [`published`](Self::published) answers at once, never waiting. `None` (the
+    /// default): no hold.
+    fn publication_hold(&self) -> Option<Duration> {
+        None
+    }
+
     /// Append to `out` the byte runs, as offsets from the memory's pointer, of the watched pages
     /// stamped later than `since`, and of those whose continuous watch began after it.
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>);
@@ -160,6 +173,8 @@ pub(crate) trait DirtyHook: Send + Sync {
     fn request(&self) -> DirtyStamp;
     /// [`DirtyPages::published`].
     fn published(&self, stamp: DirtyStamp) -> bool;
+    /// [`DirtyPages::publication_hold`].
+    fn publication_hold(&self) -> Option<Duration>;
     /// [`DirtyPages::wrote`].
     fn wrote_as_consumer(&self, range: Range<u64>);
     /// [`DirtyPages::wrote_as`].
@@ -184,6 +199,9 @@ where
     }
     fn published(&self, stamp: DirtyStamp) -> bool {
         self.0.published(stamp)
+    }
+    fn publication_hold(&self) -> Option<Duration> {
+        self.0.publication_hold()
     }
     fn wrote_as_consumer(&self, range: Range<u64>) {
         self.0.wrote(range);
@@ -274,6 +292,20 @@ impl DirtySource {
                 tally.waits_unanswered.fetch_add(1, Ordering::Relaxed);
                 (self.unanswered).store(target.0.saturating_add(1), Ordering::Release);
             }
+        }
+        published
+    }
+
+    /// Whether publication `stamp` exists, asked of a source that answers at once
+    /// ([`DirtyPages::publication_hold`]) as the scheduler looks at a held command buffer:
+    /// uncounted, and a `false` remembered nowhere, the answer being "not yet".
+    fn published_now(&self, stamp: DirtyStamp) -> bool {
+        if self.published.load(Ordering::Acquire) > stamp.0 {
+            return true;
+        }
+        let published = self.hook.published(stamp);
+        if published {
+            (self.published).fetch_max(stamp.0.saturating_add(1), Ordering::AcqRel);
         }
         published
     }
@@ -479,6 +511,25 @@ impl DirtyShadows {
             };
             *lock(&gate.stamp) = Some(stamp);
         }
+    }
+
+    /// How long `commit`'s command buffer may be held for the publication of a stamp one of its
+    /// gated copies in syncs to (the longest [`DirtyPages::publication_hold`] of them), where
+    /// one of them could count on a hold as things stand and its source has not published its
+    /// stamp yet; `None` where none waits, and for a command buffer of more than one batch, whose
+    /// copies in count on no hold ([`planned`](Self::planned)).
+    pub(crate) fn awaits_publication(&self, commit: &DirtyCommit) -> Option<Duration> {
+        (commit.gates.iter())
+            .filter_map(|gate| {
+                let stamp = (*lock(&gate.stamp))?;
+                let source = &gate.log.source;
+                let bound = source.hook.publication_hold()?;
+                let counts = !gate.written_before
+                    && gate.log.unsettled.load(Ordering::Acquire) == 0
+                    && lock(&gate.log.hold).is_some();
+                (counts && !source.published_now(stamp)).then_some(bound)
+            })
+            .max()
     }
 
     /// A committed command buffer's `commit` ([`DirtyCommit`]), as its first batch is submitted,

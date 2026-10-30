@@ -639,6 +639,9 @@ pub(super) struct State {
     /// device's logs of host pages heard of it then, for its first batch's submission to tell
     /// them (`DirtyShadows::planned`); `None` once told.
     pub(super) dirty_held: Option<Vec<Arc<ShadowCopies>>>,
+    /// The latest the scheduler holds its batch for a dirty log's publication, set at the first
+    /// look that held it (`CommandBufferShared::awaits_publication`).
+    pub(super) publication_until: Option<std::time::Instant>,
     /// The pools of its commands' set 0 (`descriptor_arena.rs`), given back or released with
     /// the uploads.
     pub(super) descriptors: DescriptorArena,
@@ -1846,6 +1849,7 @@ impl CommandBuffer {
                 shadows_copied_in: Vec::new(),
                 shadow_carry: Some(ShadowCarry::default()),
                 dirty_held: None,
+                publication_until: None,
                 descriptors: DescriptorArena::default(),
                 status_words: None,
                 mesh_grid_past: false,
@@ -2909,6 +2913,10 @@ impl CommandBuffer {
             } else {
                 state.holds.clear();
             }
+            // Its one batch may wait for a dirty log's publication (`dirty_pages.rs`).
+            let gated = state.dirty_held.is_some()
+                && state.batches.all().len() == 1
+                && lock(&self.0.dirty).gated();
             let waits = state
                 .batches
                 .all()
@@ -2935,6 +2943,7 @@ impl CommandBuffer {
                                     .is_some_and(|record| record.replay.is_some())
                         }),
                     checked: state.checks.is_some(),
+                    gated,
                 })
                 .collect();
             // A texture over the caller's image that rests out of `GENERAL`: each batch that

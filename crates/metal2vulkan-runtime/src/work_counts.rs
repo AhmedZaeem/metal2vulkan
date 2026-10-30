@@ -3644,6 +3644,11 @@ pub struct WorkCounts {
     /// all known yet (work a host step or its submission records, `tracker::ordered`'s `None`)
     /// conflicts with every batch that makes a tracked use or names a fence.
     pub heads_held_for_earlier_commits: u64,
+    /// Heads found held, for at most their dirty log's bound, until the log published the stamp
+    /// their command buffer's gated copies in sync to (`dirty_pages.rs`,
+    /// `DirtyPages::publication_hold`): so held, a copy in takes only the rows changed, where at
+    /// once it would take every row.
+    pub heads_held_for_dirty_publications: u64,
     /// Times a look left a head that needs a host step waiting at its gate: the step reads what
     /// the GPU may write, so it waits until every `VkQueue` completed what was submitted to it
     /// when the batch was otherwise ready (a predicated loop's check waits for its own `VkQueue`
@@ -5182,6 +5187,7 @@ impl Device {
             heads_held_for_checks: held_for(HeldFor::Check),
             heads_held_for_event_values: held_for(HeldFor::EventValue),
             heads_held_for_earlier_commits: held_for(HeldFor::EarlierCommit),
+            heads_held_for_dirty_publications: held_for(HeldFor::DirtyPublication),
             heads_waiting_at_their_gate: counters
                 .heads_waiting_at_their_gate
                 .load(Ordering::Relaxed),

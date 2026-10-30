@@ -32,6 +32,12 @@
 //! (`WorkCounts::dirty_waits`). A log that says at once that the stamp is not published yet
 //! (`DirtyPages::published`) is not waited for: both copies take every row.
 //!
+//! A log that gives a hold (`DirtyPages::publication_hold`) has the scheduler hold a command
+//! buffer whose copy in could count on a hold until the log published its stamp: a command buffer
+//! of another queue goes meanwhile, and once the log publishes, the held one copies only what
+//! changed (nothing); a stamp the log never publishes within the hold goes at its end, every row
+//! (`WorkCounts::heads_held_for_dirty_publications`).
+//!
 //! A render target over such pages, loaded by a pass whose draws' scissor bounds them to rows 0
 //! to 8, copies in every texel the first time and then only the rows the log reports changed: its
 //! copy in is not cut to the scissor, so the image holds every texel for the next command buffer,
@@ -54,6 +60,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const SIDE: u64 = 64;
 const ROW: u64 = 256;
@@ -68,6 +75,8 @@ struct Log {
     /// The stamp is not published yet while set: `published` answers `false` at once, waiting
     /// for nothing.
     pending: AtomicBool,
+    /// Its `publication_hold`.
+    hold: Mutex<Option<Duration>>,
     watches: AtomicU64,
     waits: AtomicU64,
     /// The writers `changed_except` was asked to leave out, and `wrote_as` named.
@@ -100,6 +109,10 @@ impl DirtyPages for Log {
 
     fn published(&self, stamp: DirtyStamp) -> bool {
         !self.pending.load(Ordering::SeqCst) && self.wait(stamp)
+    }
+
+    fn publication_hold(&self) -> Option<Duration> {
+        *self.hold.lock().unwrap()
     }
 
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>) {
@@ -616,6 +629,91 @@ fn one_wait_serves_every_gated_copy_in_of_a_commit() {
         "the log's wait never ran"
     );
     drop((first, second));
+    drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn a_held_command_buffer_waits_for_its_stamp_and_holds_back_no_other_queue() {
+    let scratch = Scratch::new("dirty-pages-hold");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    *log.hold.lock().unwrap() = Some(Duration::from_secs(5));
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let shadows = device.work_counts().shadowed_textures;
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    let source = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    if device.work_counts().shadowed_textures == shadows {
+        eprintln!("DIRTY-PAGES: no shadow made");
+        return;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let held_heads = || device.work_counts().heads_held_for_dirty_publications;
+
+    // Frame 1: no hold to count on, so nothing held.
+    run(&device, &invert, &source, &target);
+
+    // Frame 2: the stamp not published: held, while another queue's command buffer goes.
+    log.pending.store(true, Ordering::SeqCst);
+    let (heads, before) = (held_heads(), counts(&device));
+    let queue = device.new_command_queue().unwrap();
+    let held = queue.command_buffer().unwrap();
+    let mut encoder = held.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&invert).unwrap();
+    encoder.set_texture(Some(&source), 0).unwrap();
+    encoder.set_texture(Some(&target), 1).unwrap();
+    encoder
+        .dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    held.commit().unwrap();
+    let other_queue = device.new_command_queue().unwrap();
+    let elsewhere = device.new_buffer(4096, ResourceOptions::default()).unwrap();
+    let other = other_queue.command_buffer().unwrap();
+    let mut blit = other.blit_command_encoder().unwrap();
+    blit.fill_buffer(&elsewhere, 0..4096, 7).unwrap();
+    blit.end_encoding().unwrap();
+    other.commit().unwrap();
+    assert!(other.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(other.status(), CommandBufferStatus::Completed);
+    let waited = held.status();
+    let held_meanwhile = held_heads() - heads;
+    log.pending.store(false, Ordering::SeqCst);
+    assert!(held.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(held.status(), CommandBufferStatus::Completed);
+    let second = delta(&device, before);
+    eprintln!(
+        "DIRTY-PAGES: hold frame 2: {waited:?} while another queue's completed, {held_meanwhile} \
+         looks held, copies {second:?}"
+    );
+    assert_ne!(
+        waited,
+        CommandBufferStatus::Completed,
+        "it waits for its stamp"
+    );
+    assert!(held_meanwhile > 0, "held for the publication");
+    assert_eq!(second[2], 1, "then nothing copied in");
+
+    // Frame 3: a stamp never published within the hold goes at its end, every row.
+    *log.hold.lock().unwrap() = Some(Duration::from_millis(20));
+    log.pending.store(true, Ordering::SeqCst);
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    log.pending.store(false, Ordering::SeqCst);
+    let third = delta(&device, before);
+    eprintln!("DIRTY-PAGES: hold frame 3 (never published) {third:?}");
+    assert_eq!(third[1], 1, "every row at the hold's end");
+    drop(source);
     drop(buffer);
     drop(device);
 }

@@ -257,11 +257,14 @@ pub(crate) enum HeldFor {
     /// A batch of an earlier commit on another logical queue that keeps its place and whose
     /// footprint runs in commit order with its own ([`Order::is_behind`]).
     EarlierCommit,
+    /// A dirty log's publication of the stamp its gated copies in sync to, for a bounded while
+    /// (`dirty_pages.rs`, `DirtyPages::publication_hold`).
+    DirtyPublication,
 }
 
 impl HeldFor {
     /// How many there are, for the counters' array.
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
 }
 
 /// The lists the thread's wait for the GPU fills, kept with their room.
@@ -534,6 +537,8 @@ struct Held {
     gate: Option<Vec<u64>>,
     /// Its command buffer has a submission check, so it may wait for checks to run.
     checked: bool,
+    /// It may wait for a dirty log's publication ([`BatchSync::gated`]).
+    gated: bool,
     /// The makings of the pipelines its host step records were raised to a queue's first held
     /// batch's ([`hasten_heads`]).
     hastened: bool,
@@ -593,6 +598,9 @@ pub(crate) struct BatchSync {
     pub(crate) segments: bool,
     /// Its command buffer has a submission check, so it may wait for checks to run.
     pub(crate) checked: bool,
+    /// It is its command buffer's one batch, which holds a gated copy in over logged host pages,
+    /// so it may wait for the log's publication (`dirty_pages.rs`).
+    pub(crate) gated: bool,
 }
 
 impl Scheduler {
@@ -1178,6 +1186,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
             segments: batch.segments,
             gate: None,
             checked: batch.checked,
+            gated: batch.gated,
             hastened: false,
             counted_held: false,
             held_since: None,
@@ -1285,6 +1294,8 @@ fn submit_ready(
         let decodes = &state.decodes;
         let untracked_decodes = state.untracked_decodes;
         let behind = |order: &Order<Held>, sequence| is_behind(order, binary, &mut memo, sequence);
+        // The soonest a head held for a dirty log's publication is looked at again.
+        let mut publication: Option<Instant> = None;
         let next = state.order.next(behind, |held| {
             if !binary.ready(&held.binary_needs) {
                 held.held_for(HeldFor::BinarySemaphore);
@@ -1315,9 +1326,23 @@ fn submit_ready(
             let waits = event_waits(held);
             if waits.is_none() {
                 held.held_for(HeldFor::EventValue);
+                return None;
+            }
+            // Held for a bounded while for its gated copies in's stamp, so they copy only the
+            // rows changed (`DirtyPages::publication_hold`); it keeps its place, as a host step's
+            // or a check's hold does.
+            if held.gated {
+                if let Some(at) = held.buffer.awaits_publication() {
+                    held.held_for(HeldFor::DirtyPublication);
+                    publication = Some(publication.map_or(at, |by| by.min(at)));
+                    return None;
+                }
             }
             waits
         });
+        if let Some(at) = publication {
+            state.wake_by = Some(state.wake_by.map_or(at, |by| by.min(at)));
+        }
         // The heads this look found waiting behind a batch of an earlier commit on another logical
         // queue ([`is_behind`]), counted on each: the one hold that crosses logical queues and
         // `VkQueue`s. The memo holds every head the look asked about, those whose host step or
@@ -1613,6 +1638,10 @@ fn plain_ready(
         return None;
     }
     if held.buffer.groups() || !held.buffer.submits_without_the_program() {
+        return None;
+    }
+    // One held for a dirty log's publication is the scheduler's thread's, whose pass wakes for it.
+    if held.gated && held.buffer.awaits_publication().is_some() {
         return None;
     }
     event_waits(held)

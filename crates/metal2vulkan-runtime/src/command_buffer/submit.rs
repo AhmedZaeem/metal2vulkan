@@ -202,6 +202,7 @@ use ash::vk;
 use metal2vulkan::bind::ReplayFaults;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The lists a batch's submission fills and empties, kept in the scheduler's state from batch to
 /// batch with their room, so that a submission allocates none of them once they have room for
@@ -323,6 +324,25 @@ impl Submission {
     /// Whether its command buffer became `Scheduled` as it was held.
     pub(super) fn scheduled(&self) -> bool {
         self.scheduled
+    }
+}
+
+/// How often the scheduler looks again at a command buffer it holds for a dirty log's
+/// publication (`DirtyPages::publication_hold`).
+const PUBLICATION_LOOK: Duration = Duration::from_micros(500);
+
+impl CommandBufferShared {
+    /// When the scheduler looks again at this command buffer's one batch, held until a dirty log
+    /// published the stamp its gated copies in sync to (`DirtyShadows::awaits_publication`), for
+    /// at most the log's bound from the first look that held it; `None` once it may go, its first
+    /// batch's submission deciding what they copy (`DirtyShadows::planned`).
+    pub(crate) fn awaits_publication(&self) -> Option<Instant> {
+        let mut state = lock(&self.state);
+        state.dirty_held.as_ref()?;
+        let bound = (self.device.shared().dirty).awaits_publication(&lock(&self.dirty))?;
+        let now = Instant::now();
+        let until = *state.publication_until.get_or_insert(now + bound);
+        (now < until).then(|| (now + PUBLICATION_LOOK).min(until))
     }
 }
 
