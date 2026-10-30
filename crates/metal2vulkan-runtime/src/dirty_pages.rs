@@ -8,9 +8,11 @@
 //!
 //! - **The stamps.** A [`DirtyStamp`] names one of the source's publications of its log. The
 //!   runtime asks for a stamp at a command buffer's commit ([`DirtyPages::request`]) where one of
-//!   its copies takes the pages again, and waits for that publication before the command
-//!   buffer's commands are recorded for the GPU ([`DirtyPages::wait`]). A copy then syncs to
-//!   that stamp: every write made after it is stamped later.
+//!   its copies takes the pages again, and asks whether that publication exists as the command
+//!   buffer's commands are recorded for the GPU, at its submission ([`DirtyPages::published`],
+//!   which never blocks the scheduler's thread where the source can say at once): where it does
+//!   not yet, the copy takes every row. A copy then syncs to that stamp: every write made after it
+//!   is stamped later.
 //! - **The pages changed** ([`DirtyPages::changed_except`]) since the stamp a copy synced to, by
 //!   any writer but that copy's own, are the only bytes it may lack: they are copied in, the rest
 //!   skipped.
@@ -111,8 +113,19 @@ pub trait DirtyPages: Send + Sync {
     fn request(&self) -> DirtyStamp;
 
     /// Block until publication `stamp` exists, bounded (about 4 ms). `false`: the source cannot
-    /// say (or is closed), so the runtime takes every page as changed (a whole copy in).
+    /// say (or is closed), so the runtime takes every page as changed (a whole copy in). The
+    /// runtime calls it only through [`published`](Self::published)'s default.
     fn wait(&self, stamp: DirtyStamp) -> bool;
+
+    /// Whether publication `stamp` exists now, as [`wait`](Self::wait) would answer once it
+    /// returns, without blocking: the runtime asks it as a command buffer is submitted, on the
+    /// device's scheduler thread, inside its lock, where a wait would hold back every submission
+    /// of the device. `false` (not yet, or the source cannot say) makes the copy take every row.
+    /// By default [`wait`](Self::wait)'s answer, which blocks: a source that knows at once which
+    /// publication it reached overrides it.
+    fn published(&self, stamp: DirtyStamp) -> bool {
+        self.wait(stamp)
+    }
 
     /// Append to `out` the byte runs, as offsets from the memory's pointer, of the watched pages
     /// stamped later than `since`, and of those whose continuous watch began after it.
@@ -145,8 +158,8 @@ pub(crate) trait DirtyHook: Send + Sync {
     fn watch(&self, range: Range<u64>) -> Box<dyn Send + Sync>;
     /// [`DirtyPages::request`].
     fn request(&self) -> DirtyStamp;
-    /// [`DirtyPages::wait`].
-    fn wait(&self, stamp: DirtyStamp) -> bool;
+    /// [`DirtyPages::published`].
+    fn published(&self, stamp: DirtyStamp) -> bool;
     /// [`DirtyPages::wrote`].
     fn wrote_as_consumer(&self, range: Range<u64>);
     /// [`DirtyPages::wrote_as`].
@@ -169,8 +182,8 @@ where
     fn request(&self) -> DirtyStamp {
         self.0.request()
     }
-    fn wait(&self, stamp: DirtyStamp) -> bool {
-        self.0.wait(stamp)
+    fn published(&self, stamp: DirtyStamp) -> bool {
+        self.0.published(stamp)
     }
     fn wrote_as_consumer(&self, range: Range<u64>) {
         self.0.wrote(range);
@@ -207,7 +220,8 @@ pub(crate) struct DirtySource {
     pointer: u64,
     /// One past the latest stamp a wait returned `true` for; 0 for none.
     published: AtomicU64,
-    /// One past the latest stamp a wait returned `false` for; 0 for none.
+    /// One past the stamp the latest `false` answer was for (the same commit's other copies in
+    /// ask no more); 0 for none.
     unanswered: AtomicU64,
 }
 
@@ -234,33 +248,33 @@ impl DirtySource {
         address.checked_sub(self.pointer)
     }
 
-    /// Whether publication `stamp` exists: at once where a wait on it or a later one returned
-    /// `true`, `false` at once where one on it or a later one returned `false`; else
-    /// [`DirtyPages::wait`]'s answer for `stamp` itself, so a command buffer submitted long after
-    /// its commit, whose stamp was most often published by then, never waits on the scheduler's
-    /// thread for a publication a later commit asked for, and one wait serves every command
-    /// buffer committed before it (counted in `tally`).
-    fn wait(&self, stamp: DirtyStamp, tally: &DirtyTally) -> bool {
+    /// Whether publication `stamp` exists: at once where an answer for it or a later one was
+    /// `true`, `false` at once where the answer for it was `false` (its commit's other copies in);
+    /// else [`DirtyPages::published`]'s answer, which a source that knows at once gives without
+    /// blocking the scheduler's thread. Not `false` for an earlier stamp: a command buffer
+    /// submitted long after its commit finds its stamp published (counted in `tally`).
+    fn published(&self, stamp: DirtyStamp, tally: &DirtyTally) -> bool {
         if self.published.load(Ordering::Acquire) > stamp.0 {
             return true;
         }
-        if self.unanswered.load(Ordering::Acquire) > stamp.0 {
+        let target = stamp;
+        if self.unanswered.load(Ordering::Acquire) == target.0.saturating_add(1) {
             return false;
         }
-        let target = stamp;
         let started = std::time::Instant::now();
-        let published = self.hook.wait(target);
+        let published = self.hook.published(target);
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         tally.waits.fetch_add(1, Ordering::Relaxed);
         tally.wait_nanos.fetch_add(nanos, Ordering::Relaxed);
-        let answered = match published {
-            true => &self.published,
+        match published {
+            true => {
+                (self.published).fetch_max(target.0.saturating_add(1), Ordering::AcqRel);
+            }
             false => {
                 tally.waits_unanswered.fetch_add(1, Ordering::Relaxed);
-                &self.unanswered
+                (self.unanswered).store(target.0.saturating_add(1), Ordering::Release);
             }
-        };
-        answered.fetch_max(target.0.saturating_add(1), Ordering::AcqRel);
+        }
         published
     }
 
@@ -659,7 +673,7 @@ impl CopyInGate {
         let decision = *lock(&self.decision);
         let changed = decision.and_then(|Decision { since, stamp }| {
             let since = since?;
-            if !self.log.source.wait(stamp, &self.tally) {
+            if !self.log.source.published(stamp, &self.tally) {
                 return None;
             }
             let mut runs = Vec::new();

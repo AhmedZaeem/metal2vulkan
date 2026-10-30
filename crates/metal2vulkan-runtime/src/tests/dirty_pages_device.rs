@@ -29,7 +29,8 @@
 //!
 //! One wait for a log's publication serves every gated copy in of a commit, two shadows over one
 //! log among them, and a wait the log answers `false` is not made again for them
-//! (`WorkCounts::dirty_waits`).
+//! (`WorkCounts::dirty_waits`). A log that says at once that the stamp is not published yet
+//! (`DirtyPages::published`) is not waited for: both copies take every row.
 //!
 //! A render target over such pages, loaded by a pass whose draws' scissor bounds them to rows 0
 //! to 8, copies in every texel the first time and then only the rows the log reports changed: its
@@ -64,6 +65,9 @@ struct Log {
     writes: Mutex<Vec<(u64, Range<u64>, u64)>>,
     /// The wait answers `false` while set.
     unanswered: AtomicBool,
+    /// The stamp is not published yet while set: `published` answers `false` at once, waiting
+    /// for nothing.
+    pending: AtomicBool,
     watches: AtomicU64,
     waits: AtomicU64,
     /// The writers `changed_except` was asked to leave out, and `wrote_as` named.
@@ -92,6 +96,10 @@ impl DirtyPages for Log {
     fn wait(&self, _stamp: DirtyStamp) -> bool {
         self.waits.fetch_add(1, Ordering::SeqCst);
         !self.unanswered.load(Ordering::SeqCst)
+    }
+
+    fn published(&self, stamp: DirtyStamp) -> bool {
+        !self.pending.load(Ordering::SeqCst) && self.wait(stamp)
     }
 
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>) {
@@ -588,6 +596,24 @@ fn one_wait_serves_every_gated_copy_in_of_a_commit() {
         (stamps, waited, unanswered),
         (1, 1, 1),
         "one unanswered wait for both"
+    );
+
+    // Frame 4: the stamp not published yet, said at once: both copies whole, and no wait.
+    log.pending.store(true, Ordering::SeqCst);
+    let waits_before = log.waits.load(Ordering::SeqCst);
+    let before = waits(&device);
+    let gated = counts(&device);
+    run_each(&device, &invert, &sources, &target);
+    log.pending.store(false, Ordering::SeqCst);
+    let [_, asked, unanswered] = std::array::from_fn(|i| waits(&device)[i] - before[i]);
+    let gated = delta(&device, gated);
+    eprintln!("DIRTY-PAGES: waits frame 4: {asked} asked ({unanswered} false), copies {gated:?}");
+    assert_eq!(gated[1], 2, "both copies whole");
+    assert_eq!((asked, unanswered), (1, 1), "one answer for both");
+    assert_eq!(
+        log.waits.load(Ordering::SeqCst),
+        waits_before,
+        "the log's wait never ran"
     );
     drop((first, second));
     drop(buffer);

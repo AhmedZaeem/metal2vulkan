@@ -317,17 +317,19 @@ impl HostMemory {
     /// buffer's first batch is submitted, in the order the device's tracker plans the GPU's work,
     /// which an event wait may put after work committed later, and its commands are recorded for
     /// the GPU after that: a stamp asked at the commit ([`DirtyPages::request`], once per log and
-    /// commit, only where the command buffer has such a copy in) and waited for then
-    /// ([`DirtyPages::wait`], for that stamp, so one wait serves every command buffer committed
-    /// before it; none where the copy has no earlier copy to count on). A command buffer that
+    /// commit, only where the command buffer has such a copy in), and whether its publication
+    /// exists asked then ([`DirtyPages::published`], which a source that knows at once answers
+    /// without blocking the scheduler's thread, and which waits by default; one answer serves
+    /// every command buffer committed before it; none where the copy has no earlier copy to count
+    /// on): a stamp not published yet makes the copy take every row. A command buffer that
     /// wrote the bytes before the copy, or whose commands lie in more than one batch (a wait or a
     /// signal between its encoders), copies every row, and so does every copy in while such a
     /// command buffer that wrote the bytes runs. The runtime reports its own writes into the pages back to the log: a shadow's copy back
     /// or merge ([`DirtyPages::wrote_as`], the shadow its writer, at the commit and again at the
     /// completion), which that shadow's own copies in leave out
     /// ([`DirtyPages::changed_except`]), and a `replaceRegion` of a texture over them
-    /// ([`DirtyPages::wrote`]). A wait the log answers `false` makes the copy take every row, and
-    /// is not made again for a stamp at or below it. Such a shadow's copy in is never cut to the rectangle a pass's scissors bound, so its
+    /// ([`DirtyPages::wrote`]). An answer `false` makes the copy take every row, and is not asked
+    /// again for the same stamp. Such a shadow's copy in is never cut to the rectangle a pass's scissors bound, so its
     /// image holds every texel for the next command buffer. Every other copy of the pages (a
     /// shadow copied through a staging buffer, of another kind, or untracked) takes every byte,
     /// as without a log. Counted:

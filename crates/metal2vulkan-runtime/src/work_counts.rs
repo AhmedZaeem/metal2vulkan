@@ -4618,13 +4618,14 @@ pub struct WorkCounts {
     /// The stamps the commits of command buffers with a gated copy in asked of the logs: one per
     /// log and commit.
     pub dirty_stamps_asked: u64,
-    /// The waits the replays made for a log's publication (`DirtyPages::wait`): one per log
-    /// serves every stamp asked of it before the wait.
+    /// The questions the replays asked of a log's publication (`DirtyPages::published`, which
+    /// waits by default): one per log serves every stamp asked of it before the answer.
     pub dirty_waits: u64,
-    /// Of the waits, those the log answered `false`.
+    /// Of the questions, those the log answered `false`: not published yet as the command buffer
+    /// was submitted, or the log cannot say. The copy took every row.
     pub dirty_waits_unanswered: u64,
-    /// The nanoseconds the waits took, on the threads that replay command buffers before their
-    /// submission.
+    /// The nanoseconds the questions took, on the threads that replay command buffers as they are
+    /// submitted (the scheduler's, as a rule).
     pub dirty_wait_nanos: u64,
     /// Of the keeps and merges among `shadow_copies`, those whose copy of the shadow's texels into
     /// the merge's scratch is the dispatch a copy back takes, where the device runs one faster
