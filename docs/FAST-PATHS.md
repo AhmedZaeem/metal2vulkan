@@ -361,8 +361,10 @@ driver's. Each is open work.
   command and for nothing else, while one `VkQueue` runs its submissions in order and cannot
   schedule a sharing queue out of them. A device now lends the round robin every queue its families
   have past the two reserved for presenting, at least four and at most sixteen, which on a graphics
-  family of sixteen gives fourteen; a device whose families have none to spare -- MoltenVK's four
-  families of one queue, a single-graphics-queue device -- still shares, and the sharing is counted
+  family of sixteen gives fourteen, each new command queue taking the one the fewest live command
+  queues hold, so that no two live queues share one while one is free; past that many live queues,
+  and on a device whose families have none to spare -- MoltenVK's four families of one queue, a
+  single-graphics-queue device -- queues still share, and the sharing is counted
   (`WorkCounts::queues_sharing_a_vk_queue`). Not announced.
 
 - **GPU writes into read-only memory reach it off macOS.** Metal drops what a shader or the blit

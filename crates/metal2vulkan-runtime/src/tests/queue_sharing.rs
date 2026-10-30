@@ -1,6 +1,7 @@
-//! A device's `VkQueue`s are shared round robin among its command queues, and the sharing is
-//! counted: the first command queues each take a `VkQueue` of their own, and the one past them
-//! takes one an earlier command queue took (`WorkCounts::queues_sharing_a_vk_queue`).
+//! A device's `VkQueue`s are shared among its live command queues, and the sharing is counted:
+//! the first command queues each take a `VkQueue` of their own, the one past them takes one an
+//! earlier live command queue holds (`WorkCounts::queues_sharing_a_vk_queue`), and queues gone
+//! give theirs back, so new ones made then share none.
 //!
 //! # Why this is a count
 //!
@@ -78,4 +79,15 @@ fn command_queues_past_the_devices_queues_are_counted_as_sharing_one() {
             1 + step
         );
     }
+    // Queues gone give their `VkQueue`s back: as many new ones as the device has share none.
+    let shared = sharing();
+    kept.clear();
+    for _ in 0..own {
+        kept.push(device.new_command_queue().unwrap());
+    }
+    assert_eq!(
+        sharing(),
+        shared,
+        "{own} command queues made once the others went must each take a `VkQueue` of their own"
+    );
 }

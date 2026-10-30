@@ -21,10 +21,12 @@
 //! queue. The runtime answers that with queues rather than with scheduling, which one `VkQueue`
 //! cannot give: a created device lends the round robin every queue its families have past the two
 //! it reserves for presenting, up to 16 (`device/create.rs`), so a program that makes no more
-//! command queues than that shares none. Past them, and on a device whose families have one queue
-//! each (MoltenVK's four, RADV's and lavapipe's single graphics queue), queues share and the
-//! waiting stands; each queue that takes a `VkQueue` another took is counted
-//! (`WorkCounts::queues_sharing_a_vk_queue`).
+//! command queues than that shares none. A new queue takes the `VkQueue` the fewest live queues
+//! hold, and a queue gone (with its last command buffer) gives its place back, so a program that
+//! makes and drops queues shares none while no more than that many live. Past them, and on a
+//! device whose families have one queue each (MoltenVK's four, RADV's and lavapipe's single
+//! graphics queue), queues share and the waiting stands; each queue that takes a `VkQueue`
+//! another live queue holds is counted (`WorkCounts::queues_sharing_a_vk_queue`).
 //!
 //! A queue holds at most its `maxCommandBufferCount` uncompleted command buffers, as Metal's does
 //! (measured on an M3 Max with macOS 26.7 and an M4 with macOS 27.0.1, with and without API
@@ -290,8 +292,9 @@ impl Device {
 impl Drop for QueueShared {
     fn drop(&mut self) {
         // Every command buffer of the queue holds it, so none is left: no lease holds its pools'
-        // blocks (`gpu_pools.rs`).
+        // blocks (`gpu_pools.rs`), and its `VkQueue` is free for a new queue.
         self.device.forget_queue_pools(self.id);
+        self.device.queue_gone(self.vk_queue);
     }
 }
 

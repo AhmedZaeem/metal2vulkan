@@ -3747,11 +3747,11 @@ pub struct WorkCounts {
     pub slot_waits: u64,
     /// Nanoseconds those makes waited.
     pub slot_wait_nanos: u64,
-    /// Command queues made on a `VkQueue` an earlier command queue of the device took too, so
-    /// that one's command buffers wait for the other's where Metal's would not: the device shares
-    /// its `VkQueue`s round robin, so a program that makes more command queues than the device
-    /// took `VkQueue`s shares them (`queue.rs`, `device/create.rs`). Zero on a device with a
-    /// `VkQueue` for each.
+    /// Command queues made on a `VkQueue` another live command queue of the device holds, so
+    /// that one's command buffers wait for the other's where Metal's would not: a new queue takes
+    /// the `VkQueue` the fewest live queues hold, so a program with more live command queues than
+    /// the device took `VkQueue`s shares them (`queue.rs`, `device/create.rs`). Zero while a
+    /// `VkQueue` is free for each.
     pub queues_sharing_a_vk_queue: u64,
     /// The waits batches with work made for timelines at values the host had seen them reach,
     /// which make what completed work wrote visible to them: one per timeline whose completed

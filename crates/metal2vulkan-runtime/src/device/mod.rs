@@ -201,9 +201,9 @@ pub(super) struct DeviceShared {
     /// How many of `queues`, the first, logical queues share round robin; the rest are reserved
     /// for presenting queues.
     round_robin: usize,
-    /// The logical queues made round robin so far: the next one takes `VkQueue` this modulo
-    /// `round_robin`.
-    round_robin_made: AtomicU64,
+    /// The live logical queues on each of the round robin's `VkQueue`s: a new one takes the
+    /// `VkQueue` the fewest hold, and a queue's drop gives its place back.
+    round_robin_live: Mutex<Vec<u32>>,
     /// The presenting queues made so far on the reserved `VkQueue`s: the next one takes the
     /// reserved queue this modulo their number.
     presenting_made: AtomicU64,
@@ -1086,20 +1086,36 @@ impl Device {
         (self.0.contexts.clone(), self.0.contexts.fresh())
     }
 
-    /// A new logical queue's identity, and the index of the `VkQueue` it submits to: round
-    /// robin over the device's queues that are not reserved for presenting.
+    /// A new logical queue's identity, and the index of the `VkQueue` it submits to: of the
+    /// device's queues that are not reserved for presenting, the first that the fewest live
+    /// logical queues hold ([`queue_gone`](Self::queue_gone) gives a dropped one's place back),
+    /// so no two live queues share one while the device has one free.
     ///
-    /// Past the round robin's queues it gives one an earlier logical queue took, whose
+    /// Past the round robin's queues it gives one another live logical queue holds, whose
     /// submissions this queue's then wait behind where Metal's queues would not
     /// (`device/create.rs`'s `ROUND_ROBIN_CEILING`): counted,
     /// `WorkCounts::queues_sharing_a_vk_queue`.
     pub(super) fn next_queue(&self) -> (u64, usize) {
         let id = self.0.contexts.fresh();
-        let made = self.0.round_robin_made.fetch_add(1, Ordering::Relaxed);
-        if made >= self.0.round_robin as u64 {
+        let mut live = lock(&self.0.round_robin_live);
+        let (at, held) = (live.iter().copied().enumerate())
+            .min_by_key(|&(_, held)| held)
+            .unwrap_or((0, 0));
+        if held > 0 {
             self.0.counts.queue_shared_a_vk_queue();
         }
-        (id, (made % self.0.round_robin as u64) as usize)
+        if let Some(held) = live.get_mut(at) {
+            *held += 1;
+        }
+        (id, at)
+    }
+
+    /// A logical queue on the `VkQueue` at `vk_queue` went, its last command buffer with it: its
+    /// place on a round robin `VkQueue` is free for the next ([`next_queue`](Self::next_queue)).
+    pub(super) fn queue_gone(&self, vk_queue: usize) {
+        if let Some(held) = lock(&self.0.round_robin_live).get_mut(vk_queue) {
+            *held = held.saturating_sub(1);
+        }
     }
 
     /// A new presenting queue's identity, and the index of the `VkQueue` it submits to: the
@@ -1774,9 +1790,9 @@ impl Device {
             functions: Arc::new(functions),
             queue_family,
             round_robin: queues.len() - present_queues,
+            round_robin_live: Mutex::new(vec![0; queues.len() - present_queues]),
             queues: queues.into(),
             queue_families,
-            round_robin_made: AtomicU64::new(0),
             presenting_made: AtomicU64::new(0),
             compile,
             depth_ranges,
