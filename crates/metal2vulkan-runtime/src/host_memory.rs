@@ -314,13 +314,15 @@ impl HostMemory {
     /// holding every texel, where no command of the device wrote the bytes or the image since,
     /// and nothing where no page changed (bands 8 rows apart or less are one; half the rows or
     /// more, or more than 1024 bands, are every row). The decision is made as the command
-    /// buffer's commands are recorded for the GPU, after its commit and before its submission: a
-    /// stamp asked at the commit ([`DirtyPages::request`], once per log and commit, only where the
-    /// command buffer has such a copy in) and waited for then ([`DirtyPages::wait`], for the
-    /// latest stamp asked of the log so far, so one wait serves every command buffer committed
+    /// buffer's first batch is submitted, in the order the device's tracker plans the GPU's work,
+    /// which an event wait may put after work committed later, and its commands are recorded for
+    /// the GPU after that: a stamp asked at the commit ([`DirtyPages::request`], once per log and
+    /// commit, only where the command buffer has such a copy in) and waited for then
+    /// ([`DirtyPages::wait`], for that stamp, so one wait serves every command buffer committed
     /// before it; none where the copy has no earlier copy to count on). A command buffer that
-    /// waits for an event or a semaphore, or wrote the bytes before the copy, copies every row.
-    /// The runtime reports its own writes into the pages back to the log: a shadow's copy back
+    /// wrote the bytes before the copy, or whose commands lie in more than one batch (a wait or a
+    /// signal between its encoders), copies every row, and so does every copy in while such a
+    /// command buffer that wrote the bytes runs. The runtime reports its own writes into the pages back to the log: a shadow's copy back
     /// or merge ([`DirtyPages::wrote_as`], the shadow its writer, at the commit and again at the
     /// completion), which that shadow's own copies in leave out
     /// ([`DirtyPages::changed_except`]), and a `replaceRegion` of a texture over them

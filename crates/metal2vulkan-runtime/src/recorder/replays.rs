@@ -14,7 +14,7 @@ use crate::loader_word::LoaderWord;
 use crate::spares::CommandPool;
 use ash::vk::{self, Handle};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// What a device's replays share: its slot's commands, its loader word for the command buffers
@@ -70,6 +70,9 @@ struct Queue {
     replays: VecDeque<Arc<Replays>>,
     /// The replays the thread replays now, taken off `replays`.
     current: Option<Arc<Replays>>,
+    /// Replays taken off `replays` that wait for their command buffer's submission
+    /// ([`Replays::defer`]): back on `replays` once it comes, or their release.
+    deferred: Vec<Arc<Replays>>,
     /// The thread waits for a replay.
     parked: bool,
     stop: bool,
@@ -109,6 +112,10 @@ pub(crate) fn take_leaving_room<T>(queue: &mut VecDeque<T>) -> Option<T> {
 /// One command buffer's deferred command buffers (the module docs of `recorder`).
 pub(crate) struct Replays {
     state: Mutex<ReplayState>,
+    /// Its replay waits for its command buffer's first submission, which decides what a gated
+    /// copy in records (`dirty_pages.rs`): the recorder's thread leaves it, and the submission
+    /// replays it, or another thread's settle ([`RecorderShared::settle_all`]).
+    deferred: AtomicBool,
     recorder: Arc<RecorderShared>,
 }
 
@@ -192,6 +199,11 @@ impl RecorderShared {
                 let mut queue = lock(&self.queue);
                 loop {
                     if let Some(replays) = take_leaving_room(&mut queue.replays) {
+                        // Its submission decides what it records first (`Replays::defer`).
+                        if replays.deferred.load(Ordering::Acquire) {
+                            queue.deferred.push(replays);
+                            continue;
+                        }
                         queue.current = Some(Arc::clone(&replays));
                         break replays;
                     }
@@ -228,7 +240,8 @@ impl RecorderShared {
         let _settling = lock(&self.settling);
         let (queued, current) = {
             let mut queue = lock(&self.queue);
-            let queued: Vec<_> = queue.replays.drain(..).collect();
+            let mut queued: Vec<_> = queue.replays.drain(..).collect();
+            queued.append(&mut queue.deferred);
             (queued, queue.current.clone())
         };
         let mut replayed = 0;
@@ -244,7 +257,11 @@ impl RecorderShared {
 
     /// End the thread's loop once its queue is empty, and let go of the replays kept.
     pub(crate) fn stop(&self) {
-        lock(&self.queue).stop = true;
+        {
+            let queue = &mut *lock(&self.queue);
+            queue.replays.extend(queue.deferred.drain(..));
+            queue.stop = true;
+        }
         self.wake.notify_one();
         lock(&self.kept).clear();
     }
@@ -270,6 +287,7 @@ impl RecorderShared {
                     failure: None,
                     held: Vec::new(),
                 }),
+                deferred: AtomicBool::new(false),
                 recorder: Arc::clone(self),
             });
         };
@@ -563,6 +581,7 @@ impl Replays {
     /// handed out ended, `completed` where its command buffer completed), to give back to the
     /// device's spares.
     pub(crate) fn release(self: Arc<Self>, completed: bool) -> Option<(CommandPool, bool)> {
+        self.undefer();
         let pool = {
             let mut state = lock(&self.state);
             state.ended.clear();
@@ -590,6 +609,27 @@ impl Replays {
     /// Keep it for another command buffer where nothing else holds it, released
     /// ([`release`](Self::release)): where the recorder's queue holds it still, the recorder
     /// keeps it as it takes it.
+    /// Leave its replay to its command buffer's first submission, which decides what a gated copy
+    /// in records first (`dirty_pages.rs`): the recorder's thread replays it only once
+    /// [`undefer`](Self::undefer) lets it, and a settle replays it at once, as it is. Before
+    /// the commit queues it.
+    pub(crate) fn defer(&self) {
+        self.deferred.store(true, Ordering::Release);
+    }
+
+    /// Its replay may go on: once its first submission decided ([`defer`](Self::defer)), and at
+    /// its release. Back in the recorder's queue where the recorder's thread left it.
+    pub(crate) fn undefer(self: &Arc<Self>) {
+        if !self.deferred.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut queue = lock(&self.recorder.queue);
+        if let Some(at) = (queue.deferred.iter()).position(|replays| Arc::ptr_eq(replays, self)) {
+            let replays = queue.deferred.swap_remove(at);
+            queue.replays.push_back(replays);
+        }
+    }
+
     fn keep(self: Arc<Self>) {
         if Arc::strong_count(&self) == 1 {
             let recorder = Arc::clone(&self.recorder);

@@ -15,8 +15,14 @@
 //!   (`WorkCounts::dirty_copy_in_bytes_copied`).
 //! - Frame 3 with no write copies nothing (`dirty_copies_in_skipped`).
 //! - Frame 4: the log's wait answers `false`: every row is copied, row 40's new bytes too.
-//! - Frame 7: a command buffer that waits for an event copies every row: work committed after it
-//!   may run before it.
+//! - Frame 7: a command buffer that waits for an event, which a command buffer committed after
+//!   it signals once its blit fill wrote row 50's bytes (a GPU write no log hears of), runs after
+//!   the fill: decided as it is submitted, after the fill let go of its hold, it copies every row
+//!   and reads the filled row, as Metal shows a command buffer what the work it waits for wrote.
+//! - Frame 8: a command buffer that waits for an event already reached copies nothing.
+//! - Frame 9: a command buffer of two batches (an event wait between its encoders) that writes
+//!   through the shadow may run its second after work submitted later: no hold counts until it
+//!   completes, so the next frame copies every row, and the one after nothing.
 //! - Frame 5: a kernel writes through the shadow (copied back, or merged, reported as the
 //!   shadow's own write, `wrote_as`, at the commit and again at the completion); frame 6 then
 //!   copies nothing in for it (`changed_except` leaves the shadow's own write out).
@@ -300,27 +306,85 @@ fn a_logged_shadow_copies_in_only_the_changed_rows() {
         "its copies in leave its own writes out"
     );
     assert_eq!(sixth[4], 0, "nothing copied in after its own copy back");
-    // Frame 7: a command buffer that waits for an event may run after work committed later:
-    // every row.
+    // Frame 7: a command buffer that waits for an event a command buffer committed after it
+    // signals, once its fill wrote row 50's bytes, which no log hears of: submitted after the
+    // fill, it copies every row and reads the fill.
     let event = device.new_shared_event().unwrap();
-    event.set_signaled_value(1);
+    let invert_after = |value: u64| {
+        let queue = device.new_command_queue().unwrap();
+        let command_buffer = queue.command_buffer().unwrap();
+        (command_buffer.encode_wait_for_event(EventRef::Shared(&event), value)).unwrap();
+        let mut encoder = command_buffer.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&invert).unwrap();
+        encoder.set_texture(Some(&source), 0).unwrap();
+        encoder.set_texture(Some(&target), 1).unwrap();
+        encoder
+            .dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))
+            .unwrap();
+        encoder.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        command_buffer
+    };
     let before = counts(&device);
+    let waiting = invert_after(1);
     let queue = device.new_command_queue().unwrap();
-    let command_buffer = queue.command_buffer().unwrap();
-    (command_buffer.encode_wait_for_event(EventRef::Shared(&event), 1)).unwrap();
-    let mut encoder = command_buffer.compute_command_encoder().unwrap();
-    encoder.set_compute_pipeline_state(&invert).unwrap();
-    encoder.set_texture(Some(&source), 0).unwrap();
-    encoder.set_texture(Some(&target), 1).unwrap();
-    encoder
-        .dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))
-        .unwrap();
-    encoder.end_encoding().unwrap();
-    command_buffer.commit().unwrap();
-    assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+    let filler = queue.command_buffer().unwrap();
+    let mut blit = filler.blit_command_encoder().unwrap();
+    blit.fill_buffer(&buffer, 50 * ROW..51 * ROW, 0x50).unwrap();
+    blit.end_encoding().unwrap();
+    (filler.encode_signal_event(EventRef::Shared(&event), 1)).unwrap();
+    filler.commit().unwrap();
+    for command_buffer in [&waiting, &filler] {
+        assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+        assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+    }
     let seventh = delta(&device, before);
-    eprintln!("DIRTY-PAGES: frame 7 (after an event wait) {seventh:?}");
-    assert_eq!(seventh[1], 1, "a whole copy after an event wait");
+    eprintln!("DIRTY-PAGES: frame 7 (after an event a later fill signals) {seventh:?}");
+    assert_eq!(
+        texel(&target, 50),
+        inverted(0x50),
+        "it reads the fill it waited for"
+    );
+    assert_eq!(seventh[1], 1, "a whole copy after a write no log hears of");
+    // Frame 8: a wait for a value already reached; nothing changed since frame 7's copy.
+    let before = counts(&device);
+    let reached = invert_after(1);
+    assert!(reached.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(reached.status(), CommandBufferStatus::Completed);
+    let eighth = delta(&device, before);
+    eprintln!("DIRTY-PAGES: frame 8 (after an event already reached) {eighth:?}");
+    assert_eq!(eighth[2], 1, "nothing copied in");
+    assert_eq!(texel(&target, 50), inverted(0x50));
+    // Frame 9: two batches, the first writing through the shadow.
+    let split = queue.command_buffer().unwrap();
+    for (from, into) in [(&target, &source), (&source, &target)] {
+        let mut encoder = split.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&invert).unwrap();
+        encoder.set_texture(Some(from), 0).unwrap();
+        encoder.set_texture(Some(into), 1).unwrap();
+        encoder
+            .dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))
+            .unwrap();
+        encoder.end_encoding().unwrap();
+        if std::ptr::eq(into, &source) {
+            (split.encode_wait_for_event(EventRef::Shared(&event), 1)).unwrap();
+        }
+    }
+    split.commit().unwrap();
+    assert!(split.wait_until_completed_for(WAIT).is_ok());
+    assert_eq!(split.status(), CommandBufferStatus::Completed);
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    let ninth = delta(&device, before);
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    let tenth = delta(&device, before);
+    eprintln!("DIRTY-PAGES: frames after a split command buffer's write {ninth:?} {tenth:?}");
+    assert_eq!(
+        ninth[1], 1,
+        "every row after a write no hold could count on"
+    );
+    assert_eq!(tenth[2], 1, "then nothing: the write's hold is settled");
     // SAFETY: every command completed; nothing writes the bytes now.
     let now = unsafe { std::slice::from_raw_parts(bytes, span) };
     assert_eq!(now[10 * ROW as usize], 0x20);

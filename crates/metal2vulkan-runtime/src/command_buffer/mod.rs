@@ -95,7 +95,7 @@ use super::replay::Replay;
 use super::residency::Residency;
 use super::resource::{ObjectId, ResourceKey};
 use super::scheduler::{BatchSync, StepWaits};
-use super::shadow::ShadowCarry;
+use super::shadow::{ShadowCarry, ShadowCopies};
 use super::spares::CommandPool;
 use super::sparse::encoder::SparseUpdate;
 use super::sparse::indirect;
@@ -635,6 +635,10 @@ pub(super) struct State {
     /// another writer's bytes; Metal refuses such a wait while an encoder is open, so one never
     /// finds it lent out.
     shadow_carry: Option<ShadowCarry>,
+    /// The shadowed textures its end left holding their truth, kept from its commit, where the
+    /// device's logs of host pages heard of it then, for its first batch's submission to tell
+    /// them (`DirtyShadows::planned`); `None` once told.
+    pub(super) dirty_held: Option<Vec<Arc<ShadowCopies>>>,
     /// The pools of its commands' set 0 (`descriptor_arena.rs`), given back or released with
     /// the uploads.
     pub(super) descriptors: DescriptorArena,
@@ -1841,6 +1845,7 @@ impl CommandBuffer {
                 shadow_attachments: Vec::new(),
                 shadows_copied_in: Vec::new(),
                 shadow_carry: Some(ShadowCarry::default()),
+                dirty_held: None,
                 descriptors: DescriptorArena::default(),
                 status_words: None,
                 mesh_grid_past: false,
@@ -2716,21 +2721,22 @@ impl CommandBuffer {
             // What of it the live buffers list once used, held weakly: the device's registries'
             // locks, which take no other, inside this one.
             let reached = state.reached(device.shared(), runs);
-            // The device's logs of host pages hear of its writes and gated copies in, in commit
-            // order, and of the shadows its end left holding their truth (`dirty_pages.rs`).
-            // One that waits for an event or a semaphore may run after work committed later,
-            // whose writes no commit before it noted: its copies in count on no hold.
+            // The device's logs of host pages give each of its gated copies in a stamp now, at the
+            // commit; they hear of its writes, its gated copies in and the shadows its end left
+            // holding their truth as its first batch is submitted, in the order the tracker plans
+            // it, which an event wait may put after work committed later (`dirty_pages.rs`). Its
+            // replay waits for that where a gated copy in's regions depend on it.
             if device.shared().dirty.any() {
                 let held = match (&failure, &state.shadow_carry) {
                     (None, Some(carry)) => carry.held_whole(),
                     _ => Vec::new(),
                 };
-                let waits = (state.batches.all().iter())
-                    .any(|batch| !batch.waits.is_empty() || !batch.binary_waits.is_empty());
-                device
-                    .shared()
-                    .dirty
-                    .committed(&lock(&self.0.dirty), &held, waits);
+                let dirty = lock(&self.0.dirty);
+                device.shared().dirty.stamped(&dirty);
+                if let (true, Some(replays)) = (dirty.gated(), &state.replays) {
+                    replays.defer();
+                }
+                state.dirty_held = Some(held);
             }
             (segments, places, failure, reached, hangs)
         };
@@ -4477,8 +4483,8 @@ impl CommandBufferShared {
             // The logs of host pages hear of its shadows' copies back again, now they ran, and
             // let go of the holds a failed one's copies in set (`dirty_pages.rs`).
             if self.device.shared().dirty.any() {
-                let dirty = lock(&self.dirty);
-                (self.device.shared().dirty).completed(&dirty, result.is_err());
+                let mut dirty = lock(&self.dirty);
+                (self.device.shared().dirty).completed(&mut dirty, result.is_err());
             }
             match result {
                 Ok(()) => {

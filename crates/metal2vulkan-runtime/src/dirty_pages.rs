@@ -18,6 +18,17 @@
 //!   ([`DirtyPages::wrote_as`]), naming the copy as their writer, so other copies of the same
 //!   pages see them as changed and the copy's own copies in, under a log that keeps writers
 //!   apart, do not.
+//! - **In the order the GPU runs them.** A shadow's hold (the stamp as of which its image holds
+//!   every texel of the truth) is decided, let go of and taken in the order the scheduler submits
+//!   command buffers, which is the order its tracker plans their accesses in, as each one's first
+//!   batch is submitted ([`DirtyShadows::planned`]): a command buffer that waits for an event may
+//!   be submitted after work committed later, and that work's writes then run before its copies
+//!   in. The stamp a copy in syncs to is still asked at the commit ([`DirtyShadows::stamped`]),
+//!   so every CPU write made before the commit is in the publication it waits for, and that
+//!   publication has most often come by the submission. A command buffer whose commands lie in
+//!   more than one batch may run its later batches after work submitted after its first: its
+//!   copies in count on no hold, it takes none, and its writes keep every hold they meet let go
+//!   of until it completes.
 //! - **Correctness first.** A wait that answers `false`, a source that cannot say, and a copy
 //!   that holds nothing it may count on all copy every byte.
 //!
@@ -198,8 +209,6 @@ pub(crate) struct DirtySource {
     published: AtomicU64,
     /// One past the latest stamp a wait returned `false` for; 0 for none.
     unanswered: AtomicU64,
-    /// One past the latest stamp asked of it ([`DirtySource::request`]); 0 for none.
-    requested: AtomicU64,
 }
 
 impl DirtySource {
@@ -210,15 +219,12 @@ impl DirtySource {
             pointer,
             published: AtomicU64::new(0),
             unanswered: AtomicU64::new(0),
-            requested: AtomicU64::new(0),
         })
     }
 
     /// [`DirtyPages::request`], counted in `tally`.
     fn request(&self, tally: &DirtyTally) -> DirtyStamp {
         let stamp = self.hook.request();
-        self.requested
-            .fetch_max(stamp.0.saturating_add(1), Ordering::AcqRel);
         tally.stamps.fetch_add(1, Ordering::Relaxed);
         stamp
     }
@@ -230,9 +236,10 @@ impl DirtySource {
 
     /// Whether publication `stamp` exists: at once where a wait on it or a later one returned
     /// `true`, `false` at once where one on it or a later one returned `false`; else
-    /// [`DirtyPages::wait`]'s answer for the latest stamp asked of the source, which every
-    /// commit's stamp asked so far is at or below, so one wait serves every command buffer
-    /// committed before it (counted in `tally`).
+    /// [`DirtyPages::wait`]'s answer for `stamp` itself, so a command buffer submitted long after
+    /// its commit, whose stamp was most often published by then, never waits on the scheduler's
+    /// thread for a publication a later commit asked for, and one wait serves every command
+    /// buffer committed before it (counted in `tally`).
     fn wait(&self, stamp: DirtyStamp, tally: &DirtyTally) -> bool {
         if self.published.load(Ordering::Acquire) > stamp.0 {
             return true;
@@ -240,8 +247,7 @@ impl DirtySource {
         if self.unanswered.load(Ordering::Acquire) > stamp.0 {
             return false;
         }
-        let latest = self.requested.load(Ordering::Acquire).saturating_sub(1);
-        let target = DirtyStamp(latest.max(stamp.0));
+        let target = stamp;
         let started = std::time::Instant::now();
         let published = self.hook.wait(target);
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -292,6 +298,10 @@ pub(crate) struct ShadowLog {
     /// The stamp as of which the image holds every texel of the truth, but for the pages the log
     /// reports changed since (the module docs); `None` where it holds nothing a copy may count on.
     hold: Mutex<Option<DirtyStamp>>,
+    /// The submitted command buffers whose writes meet the truth or the shadow from a batch that
+    /// may run after work submitted later, until each completes: while any does, the hold stays
+    /// let go of and no copy in counts on it ([`DirtyShadows::planned`]).
+    unsettled: AtomicU64,
 }
 
 impl ShadowLog {
@@ -392,6 +402,7 @@ impl DirtyShadows {
             truth: offsets.clone(),
             _watch: source.hook.watch(offsets),
             hold: Mutex::new(None),
+            unsettled: AtomicU64::new(0),
         });
         logs.push(Arc::clone(&log));
         self.any.store(true, Ordering::Release);
@@ -400,11 +411,15 @@ impl DirtyShadows {
 
     /// A command buffer whose commit was `commit` completed, `failed` or not: its shadows' copies
     /// back and merges are reported again ([`DirtyPages::wrote_as`]), now they ran, so a stamp
-    /// asked between the commit and the GPU's write still finds them; where it failed, the holds
-    /// its copies in set are let go of, its copies having perhaps not run.
-    pub(crate) fn completed(&self, commit: &DirtyCommit, failed: bool) {
+    /// asked between the commit and the GPU's write still finds them; the holds its writes
+    /// kept unsettled may be taken again; where it failed, the holds its copies in set are let go
+    /// of, its copies having perhaps not run.
+    pub(crate) fn completed(&self, commit: &mut DirtyCommit, failed: bool) {
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
+        }
+        for log in commit.unsettling.drain(..) {
+            log.unsettled.fetch_sub(1, Ordering::AcqRel);
         }
         if !failed {
             return;
@@ -428,71 +443,96 @@ impl DirtyShadows {
             .cloned()
     }
 
-    /// A committed command buffer's `commit` ([`DirtyCommit`]), in commit order: its gates take
-    /// the holds as they stand and a stamp each (no hold where it `waits` for an event or a
-    /// semaphore: work committed after it may run before it), its writes let go of the holds of
-    /// the shadows they meet, and the shadows its end left holding every texel of the truth
-    /// (`held`) hold from their stamp on.
-    pub(crate) fn committed(&self, commit: &DirtyCommit, held: &[Arc<ShadowCopies>], waits: bool) {
-        let DirtyCommit {
-            written,
-            gates,
-            wrote,
-        } = commit;
-        // One stamp per source and commit.
+    /// A committed command buffer's `commit` ([`DirtyCommit`]), at its commit: a stamp of each
+    /// source its gated copies in read, one per source, asked now, so every CPU write made before
+    /// the commit, which Metal shows the command buffer, is in the publication its copies in wait
+    /// for ([`planned`](Self::planned) decides what they copy); and its copies back and merges,
+    /// reported ([`DirtyPages::wrote_as`]) before any stamp a later commit asks.
+    pub(crate) fn stamped(&self, commit: &DirtyCommit) {
+        for (log, range) in &commit.wrote {
+            log.wrote_back(range.clone());
+        }
         let mut stamps: Vec<(Arc<DirtySource>, DirtyStamp)> = Vec::new();
-        let mut stamp_of = |source: &Arc<DirtySource>| {
-            if let Some((_, stamp)) = stamps.iter().find(|(s, _)| Arc::ptr_eq(s, source)) {
-                return *stamp;
-            }
-            let stamp = source.request(&self.tally);
-            stamps.push((Arc::clone(source), stamp));
-            stamp
-        };
+        for gate in &commit.gates {
+            let source = &gate.log.source;
+            let stamp = match stamps.iter().find(|(s, _)| Arc::ptr_eq(s, source)) {
+                Some((_, stamp)) => *stamp,
+                None => {
+                    let stamp = source.request(&self.tally);
+                    stamps.push((Arc::clone(source), stamp));
+                    stamp
+                }
+            };
+            *lock(&gate.stamp) = Some(stamp);
+        }
+    }
+
+    /// A committed command buffer's `commit` ([`DirtyCommit`]), as its first batch is submitted,
+    /// in the order the scheduler submits command buffers and its tracker plans them (the module
+    /// docs): its gates take the holds as they stand, each with the stamp its commit asked (no hold
+    /// where the command buffer wrote the truth or the shadow before the copy, where it is `split`
+    /// over more than one batch, whose later ones may run after work submitted later, or where
+    /// another such command buffer's writes keep the hold unsettled); its writes let go of the
+    /// holds of the shadows they meet, a `split` one's until it completes; and the shadows its end
+    /// left holding every texel of the truth (`held`) hold from their stamp on, but for a `split`
+    /// one's.
+    pub(crate) fn planned(
+        &self,
+        commit: &mut DirtyCommit,
+        held: &[Arc<ShadowCopies>],
+        split: bool,
+    ) {
         let mut synced: Vec<(Arc<ShadowLog>, DirtyStamp)> = Vec::new();
-        for gate in gates {
-            let since = match gate.written_before || waits {
+        for gate in &commit.gates {
+            let Some(stamp) = *lock(&gate.stamp) else {
+                continue;
+            };
+            let unsettled = gate.log.unsettled.load(Ordering::Acquire) > 0;
+            let since = match gate.written_before || split || unsettled {
                 true => None,
                 false => *lock(&gate.log.hold),
             };
-            let stamp = stamp_of(&gate.log.source);
             *lock(&gate.decision) = Some(Decision { since, stamp });
             synced.push((Arc::clone(&gate.log), stamp));
-        }
-        for (log, range) in wrote {
-            log.wrote_back(range.clone());
         }
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
         for log in &logs {
             let Some(copies) = log.copies.upgrade() else {
                 continue;
             };
-            let meets =
-                |used: &Use<ResourceKey>| used.key == copies.shadow_key || copies.meets(used);
-            if written.iter().any(meets) {
-                *lock(&log.hold) = None;
+            if !commit.wrote_over(&copies) {
+                continue;
             }
+            *lock(&log.hold) = None;
+            if split {
+                log.unsettled.fetch_add(1, Ordering::AcqRel);
+                commit.unsettling.push(Arc::clone(log));
+            }
+        }
+        if split {
+            return;
         }
         for (log, stamp) in synced {
             let holds = log
                 .copies
                 .upgrade()
                 .is_some_and(|copies| held.iter().any(|h| Arc::ptr_eq(h, &copies)));
-            if holds {
+            if holds && log.unsettled.load(Ordering::Acquire) == 0 {
                 *lock(&log.hold) = Some(stamp);
             }
         }
     }
 }
 
-/// What a command buffer did that the logs' holds hear of at its commit
-/// ([`DirtyShadows::committed`]): its commands' writes, its gated copies in, and its shadows'
-/// copies back and merges into logged pages.
+/// What a command buffer did that the logs' holds hear of as it is submitted
+/// ([`DirtyShadows::planned`]): its commands' writes, its gated copies in, its shadows' copies
+/// back and merges into logged pages, and the logs its writes keep unsettled until it completes.
 #[derive(Default)]
 pub(crate) struct DirtyCommit {
     written: Vec<Use<ResourceKey>>,
     gates: Vec<Arc<CopyInGate>>,
     wrote: Vec<(Arc<ShadowLog>, Range<u64>)>,
+    unsettling: Vec<Arc<ShadowLog>>,
 }
 
 /// The most writes a command buffer keeps apart, past which they are one write of everything.
@@ -510,7 +550,8 @@ impl DirtyCommit {
         }
     }
 
-    /// Whether a write noted so far meets `copies`' truth or its shadow.
+    /// Whether a write noted so far meets `copies`' truth or its shadow (every one, past
+    /// [`WRITES`]).
     fn wrote_over(&self, copies: &ShadowCopies) -> bool {
         self.written.len() >= WRITES
             || (self.written.iter()).any(|used| used.key == copies.shadow_key || copies.meets(used))
@@ -528,6 +569,7 @@ impl DirtyCommit {
             texel,
             tally: Arc::clone(&shadows.tally),
             written_before: self.wrote_over(copies),
+            stamp: Mutex::new(None),
             decision: Mutex::new(None),
         });
         self.gates.push(Arc::clone(&gate));
@@ -538,9 +580,15 @@ impl DirtyCommit {
     pub(crate) fn wrote_back(&mut self, log: Arc<ShadowLog>, range: Range<u64>) {
         self.wrote.push((log, range));
     }
+
+    /// Whether it holds a gated copy in, whose regions its submission decides
+    /// ([`DirtyShadows::planned`]): its replay waits for that (`Replays::defer`).
+    pub(crate) fn gated(&self) -> bool {
+        !self.gates.is_empty()
+    }
 }
 
-/// A shadow's copy in recorded with what its commit decides ([`DirtyShadows::committed`]): the
+/// A shadow's copy in recorded with what its submission decides ([`DirtyShadows::planned`]): the
 /// stamp its log's hold stood at, where it held one, and the stamp it syncs to.
 #[derive(Clone, Copy)]
 struct Decision {
@@ -549,8 +597,9 @@ struct Decision {
 }
 
 /// A copy in of a shadow over logged host pages, its regions decided as its command buffer's
-/// commands are recorded for the GPU (`recorder`): every region where its commit found no hold
-/// or its log cannot say, else the rows of the pages changed since the hold.
+/// commands are recorded for the GPU (`recorder`): every region where its submission found no
+/// hold, where it is recorded before its submission decided, or where its log cannot say, else
+/// the rows of the pages changed since the hold.
 pub(crate) struct CopyInGate {
     log: Arc<ShadowLog>,
     /// The bytes of one texel in the buffer.
@@ -558,6 +607,8 @@ pub(crate) struct CopyInGate {
     /// The command buffer wrote the truth or the shadow before the copy.
     written_before: bool,
     tally: Arc<DirtyTally>,
+    /// The stamp its commit asked of the log's source ([`DirtyShadows::stamped`]).
+    stamp: Mutex<Option<DirtyStamp>>,
     decision: Mutex<Option<Decision>>,
 }
 

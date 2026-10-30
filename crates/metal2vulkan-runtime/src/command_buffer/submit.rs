@@ -395,6 +395,17 @@ impl CommandBufferShared {
         if !state.later_group(device, self, index) {
             return Ok(Submitting::Later);
         }
+        // The device's logs of host pages hear of what it did as its first batch is submitted,
+        // under the scheduler's lock and before the tracker plans the batch, in the order the
+        // GPU runs it, and its gated copies in are decided before its replay (`dirty_pages.rs`).
+        // One of several batches may run its later ones after work submitted after this one.
+        if let Some(held) = state.dirty_held.take() {
+            let split = state.batches.all().len() > 1;
+            (shared.dirty).planned(&mut lock(&self.dirty), &held, split);
+            if let Some(replays) = &state.replays {
+                replays.undefer();
+            }
+        }
         // Each of Metal's submissions it found rebound, or holding a detached buffer, fails as
         // its own batch is submitted, after the batch's checks: one a check failed keeps the
         // check's code.

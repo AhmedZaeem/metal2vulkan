@@ -1219,7 +1219,9 @@ impl ShadowCopy {
     }
 
     /// The log of a copy back or merge of a shadow whose copies in a log decides, and the
-    /// `VkBuffer` bytes it writes (`dirty_pages.rs`): reported to the log as the shadow's own.
+    /// `VkBuffer` bytes it writes (`dirty_pages.rs`): reported to the log as the shadow's own,
+    /// the rows of the rectangle it is cut to where it is one region's (every other texture over
+    /// the bytes copies those rows in again, the rest not).
     pub(super) fn written_log(&self, device: &Device) -> Option<(Arc<ShadowLog>, Range<u64>)> {
         let c = &self.copies;
         if !matches!(self.step, Step::Back | Step::Merge(_)) {
@@ -1233,7 +1235,15 @@ impl ShadowCopy {
             return None;
         };
         let log = device.shared().dirty.kept(c)?;
-        let bytes = copied_bytes(regions, (*texel)?)?;
+        let texel = (*texel)?;
+        let area = match &self.step {
+            Step::Merge(merge) => merge.area(),
+            _ => self.area,
+        };
+        let bytes = match (area, &regions[..]) {
+            (Some(area), [region]) => copied_bytes(&[part_of(region, area, texel)?], texel)?,
+            _ => copied_bytes(regions, texel)?,
+        };
         Some((log, bytes))
     }
 
