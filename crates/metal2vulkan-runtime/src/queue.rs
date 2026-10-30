@@ -371,6 +371,12 @@ impl CommandQueue {
         *lock(&self.0.label) = Some(label.to_owned());
     }
 
+    /// The queue's identity for diagnostics: the address of its shared state, the same through
+    /// every handle to the queue while it lives.
+    pub fn diagnostic_id(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
+    }
+
     /// `label`.
     pub fn label(&self) -> Option<String> {
         lock(&self.0.label).clone()
