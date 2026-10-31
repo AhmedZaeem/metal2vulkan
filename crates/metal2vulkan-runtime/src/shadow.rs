@@ -220,6 +220,9 @@ pub(super) struct ShadowCopies {
     /// copies in that copy nothing are counted apart
     /// (`WorkCounts::dirty_copies_in_skipped_in_shared_homes`).
     pub(super) shared: std::sync::atomic::AtomicBool,
+    /// It is a home (`texture/homes.rs`), whose image a deferred write-back may hold
+    /// (`dirty_pages/deferred.rs`).
+    pub(super) homed: std::sync::atomic::AtomicBool,
     /// Counted while it lives (`live.rs`).
     pub(super) _counted: crate::live::Counted,
 }
@@ -798,7 +801,56 @@ impl ShadowCopies {
     pub(super) fn merges_back(&self) -> bool {
         let bytes = matches!(&self.source, ShadowSource::Bytes { .. });
         let other_writer = self.backing != Backing::PrivateBuffer || !self.tracked;
-        bytes && other_writer && !self.drops_writes && self.unmerged().is_none()
+        let merges = bytes && other_writer && !self.drops_writes && self.unmerged().is_none();
+        // A home whose writes back are deferred takes no keep: its copy back is gated.
+        merges && !self.defers()
+    }
+
+    /// Whether its copies back are deferred (`dirty_pages/deferred.rs`): a home over host pages
+    /// whose source writes back on request, its texels one region of the pages' `VkBuffer`.
+    pub(super) fn defers(&self) -> bool {
+        let ShadowSource::Bytes {
+            buffer: ShadowBuffer::Rebound(buffer),
+            target:
+                ShadowTarget::Image {
+                    regions,
+                    staging: None,
+                    texel: Some(_),
+                    ..
+                },
+            ..
+        } = &self.source
+        else {
+            return false;
+        };
+        if !self.homed.load(Ordering::Relaxed) || !self.tracked || regions.len() != 1 {
+            return false;
+        }
+        let pages = buffer.upgrade().and_then(|buffer| buffer.host_pages());
+        let policy = pages.and_then(|pages| pages.dirty().map(|dirty| dirty.write_back()));
+        policy == Some(crate::dirty_pages::WriteBack::OnRequest)
+    }
+
+    /// The buffer over host pages its texels lie in, where they do and it lives.
+    pub(crate) fn rebound_buffer(&self) -> Option<crate::Buffer> {
+        match &self.source {
+            ShadowSource::Bytes {
+                buffer: ShadowBuffer::Rebound(buffer),
+                ..
+            } => buffer.upgrade(),
+            _ => None,
+        }
+    }
+
+    /// The bytes of a texel of its image's copies, where its texels lie in a buffer as rows.
+    pub(crate) fn texel(&self) -> Option<u64> {
+        match &self.source {
+            ShadowSource::Bytes {
+                target: ShadowTarget::Image { texel, .. },
+                ..
+            } => *texel,
+            _ => None,
+        }
     }
 
     /// Whether two shadowed textures copy some of the same truth.
@@ -1031,6 +1083,13 @@ pub(super) enum Step<M> {
 
 /// One copy between a shadowed texture's buffer and its shadow.
 #[derive(Clone)]
+/// The gate of a copy whose regions are decided as its command buffer replays
+/// (`dirty_pages.rs`): a copy in's, or a deferred write-back's copy back.
+pub(super) enum CopyGate {
+    In(Arc<CopyInGate>),
+    Back(Arc<crate::dirty_pages::BackGate>),
+}
+
 pub(super) struct ShadowCopy<M = Arc<ShadowMerge>> {
     pub(super) copies: Arc<ShadowCopies>,
     pub(super) step: Step<M>,
@@ -1188,6 +1247,19 @@ fn image_copy_texels(region: &vk::ImageCopy) -> u64 {
 }
 
 impl ShadowCopy {
+    /// A flush of the deferred rows `copies` owns (`Device::write_back_deferred`): a copy back of
+    /// every texel, which its gate cuts to those rows (`dirty_pages/deferred.rs`).
+    pub(super) fn flush(copies: Arc<ShadowCopies>) -> ShadowCopy {
+        ShadowCopy {
+            copies,
+            step: Step::Back,
+            kept: false,
+            area: None,
+            cause: None,
+            moves: None,
+        }
+    }
+
     /// The log of a copy in of every texel of a tracked 2D texture's image straight from a
     /// buffer over host pages a consumer logs (`dirty_pages.rs`), made or kept by `device`, and
     /// the bytes of one texel: what may decide the copy's regions as its command buffer replays.
@@ -1584,8 +1656,13 @@ impl ShadowCopy {
         device: &Vk,
         command_buffer: vk::CommandBuffer,
         back: Option<&RowCopies>,
-        gate: Option<Arc<CopyInGate>>,
+        gate: Option<CopyGate>,
     ) {
+        let (gate, back_gate) = match gate {
+            Some(CopyGate::In(gate)) => (Some(gate), None),
+            Some(CopyGate::Back(gate)) => (None, Some(gate)),
+            None => (None, None),
+        };
         let c = &self.copies;
         let moves = self.moves.as_deref();
         let into_shadow = match &self.step {
@@ -1849,6 +1926,24 @@ impl ShadowCopy {
                     &regions,
                 );
             } else {
+                // A deferred write-back's copy back takes the rows its gate decides
+                // (`dirty_pages/deferred.rs`).
+                let gated = (back_gate.filter(|_| staging.is_none())).is_some_and(|gate| {
+                    if let [region] = &regions[..] {
+                        let top = u32::try_from(region.image_offset.y).unwrap_or(0);
+                        gate.recorded(top..top + region.image_extent.height);
+                    }
+                    let copy = (image, vk::ImageLayout::GENERAL, texels);
+                    super::recorder::copy_image_to_buffer_gated(
+                        command_buffer,
+                        gate,
+                        copy,
+                        &regions,
+                    )
+                });
+                if gated {
+                    return;
+                }
                 device.cmd_copy_image_to_buffer(
                     command_buffer,
                     image,

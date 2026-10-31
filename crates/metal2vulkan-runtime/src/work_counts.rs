@@ -4716,6 +4716,27 @@ pub struct WorkCounts {
     /// (`dirty_pages.rs`'s `Sibling`): its image copied into theirs in the device's memory, then
     /// from the pages only the rows other writers changed since its stamp.
     pub dirty_copies_in_from_siblings: u64,
+    /// Rows of homes over pages whose source writes back on request (`WriteBack::OnRequest`)
+    /// whose copies back were deferred, each time (`dirty_pages/deferred.rs`).
+    pub write_back_rows_deferred: u64,
+    /// Flushes of a home's deferred rows (`Device::write_back_deferred`).
+    pub write_back_flushes: u64,
+    /// The bytes copied back from shadows' images into host pages a source logs: an eager copy
+    /// back's or merge's span of the pages, and a gated copy back's or flush's rows.
+    pub write_back_bytes: u64,
+    /// Deferred rows the CPU wrote while they were deferred, its writes kept and the GPU's
+    /// lost there (an unlocked CPU write).
+    pub deferred_rows_lost_to_unlocked_cpu_writes: u64,
+    /// Copies in over deferred rows that could take them from no home's image (their owner's
+    /// image not read by the copy, or no base for it), copied from the pages.
+    pub deferred_rows_unordered: u64,
+    /// Requests for the deferred writes (`Device::write_back_deferred`) that returned before
+    /// their flush completed (two seconds).
+    pub write_back_flushes_unfinished: u64,
+    /// Copies back of homes over pages whose source writes back on request made at once, not
+    /// deferred, because other work in flight, or later in their own command buffer, reaches
+    /// their bytes another way (`dirty_pages/deferred.rs`).
+    pub write_back_deferrals_refused: u64,
     /// The nanoseconds the questions took, on the threads that replay command buffers as they are
     /// submitted (the scheduler's, as a rule).
     pub dirty_wait_nanos: u64,
@@ -5700,6 +5721,13 @@ impl Device {
             dirty_watched_bytes: dirty.watched_bytes.load(Ordering::Relaxed),
             dirty_watched_bytes_released: dirty.watched_bytes_released.load(Ordering::Relaxed),
             dirty_copies_in_from_siblings: dirty.from_siblings.load(Ordering::Relaxed),
+            write_back_rows_deferred: dirty.deferred_rows.load(Ordering::Relaxed),
+            write_back_flushes: dirty.flushes.load(Ordering::Relaxed),
+            write_back_bytes: dirty.write_back_bytes.load(Ordering::Relaxed),
+            deferred_rows_lost_to_unlocked_cpu_writes: dirty.lost_rows.load(Ordering::Relaxed),
+            deferred_rows_unordered: dirty.unordered.load(Ordering::Relaxed),
+            write_back_flushes_unfinished: dirty.flushes_unfinished.load(Ordering::Relaxed),
+            write_back_deferrals_refused: dirty.deferrals_refused.load(Ordering::Relaxed),
             dirty_wait_nanos: dirty.wait_nanos.load(Ordering::Relaxed),
             shadow_merge_copies_dispatched: counters
                 .shadow_merge_copies_dispatched

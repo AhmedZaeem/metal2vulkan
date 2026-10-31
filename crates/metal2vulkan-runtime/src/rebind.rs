@@ -935,6 +935,8 @@ impl Buffer {
         keep_alive: Option<KeepAlive>,
     ) -> Result<(), Error> {
         const CALL: &str = "rebind_bytes_no_copy";
+        // The GPU's deferred writes of its bytes go back into the pages they were made over.
+        self.device().flush_deferred_of(self);
         let Some(cell) = self.host_cell() else {
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
@@ -987,6 +989,10 @@ impl Heap {
         keep_alive: Option<KeepAlive>,
     ) -> Result<(), Error> {
         const CALL: &str = "rebind_bytes_no_copy";
+        if let Some(own) = self.bytes() {
+            // As a buffer's rebind does.
+            self.device().flush_deferred_of(own);
+        }
         let Some((own, cell)) = self
             .bytes()
             .and_then(|own| own.host_cell().map(|cell| (own, cell)))

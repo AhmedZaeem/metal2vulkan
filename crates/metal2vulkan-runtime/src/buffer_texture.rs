@@ -1141,6 +1141,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            homed: std::sync::atomic::AtomicBool::new(false),
             _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         })
     }
@@ -1314,6 +1315,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            homed: std::sync::atomic::AtomicBool::new(false),
             _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         };
         texels.staged = Some(Arc::new(copies));
@@ -1477,6 +1479,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            homed: std::sync::atomic::AtomicBool::new(false),
             _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         })
     }

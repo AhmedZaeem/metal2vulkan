@@ -972,11 +972,13 @@ impl Device {
     /// Writes into their memories what the shadows over memories whose sources answer
     /// [`WriteBack::OnRequest`](crate::WriteBack::OnRequest) kept of the GPU's writes, over the
     /// host addresses `host` (`None`: every one; an implementation may write back more), once the
-    /// commands that wrote them complete, and returns when it is there. Nothing is kept yet (no
-    /// shadow defers its write-back), so it returns at once.
+    /// commands that wrote them complete, and returns when it is there (`write_back.rs`): a copy
+    /// of each home's deferred rows, in the tracker's order after the work that wrote them,
+    /// waiting for it alone, at most two seconds a round. The deferred writes hold the homes,
+    /// buffers and so the device they were made on until they are written back: a host asks
+    /// for every one before it lets go of the device.
     pub fn write_back_deferred(&self, host: Option<std::ops::Range<u64>>) -> Result<(), Error> {
-        let _ = host;
-        Ok(())
+        self.flush_deferred(host)
     }
 
     /// `name`.

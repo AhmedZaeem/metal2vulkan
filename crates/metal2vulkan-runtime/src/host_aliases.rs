@@ -366,6 +366,12 @@ impl<I> HostAliases<I> {
         self.changed();
     }
 
+    /// The host bytes the buffer of `key` lies over (its first byte's address and its length),
+    /// where it lies over any ([`place`](Self::place)).
+    pub(super) fn host_of(&self, key: ResourceKey) -> Option<(u64, u64)> {
+        lock(&self.inner).placements.at.get(&key).copied()
+    }
+
     /// The buffer of `key` lies over no host bytes from now on (its bytes detached).
     pub(super) fn unplace(&self, key: ResourceKey) {
         let mut inner = lock(&self.inner);

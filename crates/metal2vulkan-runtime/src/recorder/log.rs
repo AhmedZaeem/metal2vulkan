@@ -18,7 +18,7 @@
 use super::handles;
 use super::replays::{real_of, Replays};
 use super::thunks::{real, Command};
-use crate::dirty_pages::CopyInGate;
+use crate::dirty_pages::{BackGate, CopyInGate};
 use crate::exit_guard::{self, Call};
 use crate::generated_commands::GeneratedCommandsInfo;
 use ash::vk::{self, Handle};
@@ -203,6 +203,15 @@ enum Logged {
         regions: Span,
         gate: u32,
     },
+    /// A home's copy back whose rows its gate decides at the replay (`dirty_pages/deferred.rs`):
+    /// `regions` are every region, `gate` the gate's place in [`Log::backs`].
+    GatedCopyImageToBuffer {
+        src: vk::Image,
+        layout: vk::ImageLayout,
+        dst: vk::Buffer,
+        regions: Span,
+        gate: u32,
+    },
     UpdateBuffer(vk::Buffer, vk::DeviceSize, Span),
     FillBuffer(vk::Buffer, vk::DeviceSize, vk::DeviceSize, u32),
     ClearColorImage(vk::Image, vk::ImageLayout, vk::ClearColorValue, Span),
@@ -342,6 +351,8 @@ pub(super) struct Log {
     gates: Vec<Arc<CopyInGate>>,
     /// Counted while it lives (`live.rs`).
     _counted: crate::live::Counted,
+    /// The gates of its homes' copies back (`dirty_pages/deferred.rs`).
+    backs: Vec<Arc<BackGate>>,
 }
 
 impl Log {
@@ -383,15 +394,19 @@ impl Log {
             masks: Arena::new(),
             generated: Arena::new(),
             gates: Vec::new(),
+            backs: Vec::new(),
         }
     }
 
     /// Empty it for a new command buffer of `level`, keeping its arenas' room.
-    /// Its gates (`dirty_pages.rs`), taken out as it is freed, for the caller to drop once it let
-    /// go of its locks: nothing replays it again, and a gate may hold a buffer's last handle,
-    /// whose going runs the buffer's deallocator.
-    pub(super) fn take_gates(&mut self) -> Vec<Arc<CopyInGate>> {
-        std::mem::take(&mut self.gates)
+    /// Its gates (`dirty_pages.rs`), its copies in's and copies back's, taken out as it is freed,
+    /// for the caller to drop once it let go of its locks: nothing replays it again, and a gate
+    /// may hold a buffer's last handle, whose going runs the buffer's deallocator.
+    pub(super) fn take_gates(&mut self) -> (Vec<Arc<CopyInGate>>, Vec<Arc<BackGate>>) {
+        (
+            std::mem::take(&mut self.gates),
+            std::mem::take(&mut self.backs),
+        )
     }
 
     pub(super) fn clear(&mut self, level: vk::CommandBufferLevel) {
@@ -426,6 +441,7 @@ impl Log {
         self.masks.0.clear();
         self.generated.0.clear();
         self.gates.clear();
+        self.backs.clear();
     }
 
     /// It is handle `index`'s, of a command buffer's `replays`.
@@ -783,6 +799,26 @@ impl Log {
             src,
             dst,
             layout,
+            regions,
+            gate: gate_at,
+        });
+    }
+
+    /// Log a home's copy back of `regions` from `src` into `dst` whose gate decides, at the
+    /// replay, which rows of them it records (`dirty_pages/deferred.rs`).
+    pub(super) fn copy_image_to_buffer_gated(
+        &mut self,
+        gate: Arc<BackGate>,
+        (src, layout, dst): (vk::Image, vk::ImageLayout, vk::Buffer),
+        regions: &[vk::BufferImageCopy],
+    ) {
+        let regions = (self.buffer_images).push_slice(regions);
+        let gate_at = self.backs.len() as u32;
+        self.backs.push(gate);
+        self.op(Logged::GatedCopyImageToBuffer {
+            src,
+            layout,
+            dst,
             regions,
             gate: gate_at,
         });
@@ -1466,6 +1502,28 @@ impl Log {
                         regions.len,
                         self.buffer_images.get_ptr(regions)
                     ),
+                    Logged::GatedCopyImageToBuffer {
+                        src,
+                        layout,
+                        dst,
+                        regions,
+                        gate,
+                    } => {
+                        let whole = self.buffer_images.get(regions);
+                        let mut chosen = Vec::new();
+                        self.backs[gate as usize].regions(whole, &mut chosen);
+                        if !chosen.is_empty() {
+                            call!(
+                                CmdCopyImageToBuffer,
+                                vk::PFN_vkCmdCopyImageToBuffer,
+                                src,
+                                layout,
+                                dst,
+                                chosen.len() as u32,
+                                chosen.as_ptr()
+                            );
+                        }
+                    }
                     Logged::GatedCopyBufferToImage {
                         src,
                         dst,
@@ -1855,5 +1913,24 @@ impl Log {
             vk::Result::SUCCESS => Ok(()),
             error => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::Log;
+    use crate::dirty_pages::CopyInGate;
+    use crate::live::{live, Kind};
+    use ash::vk;
+
+    #[test]
+    fn a_freed_log_lets_go_of_its_gates() {
+        let before = live(Kind::CopyInGate);
+        let mut log = Log::new(vk::CommandBufferLevel::PRIMARY);
+        // As a gated copy in recorded into it leaves it.
+        log.gates.push(CopyInGate::for_test());
+        assert_eq!(live(Kind::CopyInGate), before + 1, "the log holds its gate");
+        drop(log.take_gates());
+        assert_eq!(live(Kind::CopyInGate), before, "and lets go of it, freed");
     }
 }

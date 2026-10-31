@@ -43,12 +43,15 @@
 //!
 //! [`HostMemory::with_dirty_pages`]: crate::HostMemory::with_dirty_pages
 
+mod deferred;
+
 use super::device::lock;
 use super::gpu_time;
 use super::resource::ResourceKey;
 use super::shadow::{ShadowCopies, ShadowSource, ShadowTarget};
 use super::tracker::Use;
 use ash::vk;
+pub(crate) use deferred::{BackGate, BackKind};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -221,6 +224,8 @@ pub(crate) trait DirtyHook: Send + Sync {
     fn publication_hold(&self) -> Option<Duration>;
     /// [`DirtyPages::log_identity`].
     fn log_identity(&self) -> Option<u64>;
+    /// [`DirtyPages::write_back`].
+    fn write_back(&self) -> WriteBack;
     /// The caller's source this hooks, by its address: one source's hooks share its answers.
     fn source(&self) -> *const ();
     /// [`DirtyPages::wrote`].
@@ -253,6 +258,9 @@ where
     }
     fn log_identity(&self) -> Option<u64> {
         self.0.log_identity()
+    }
+    fn write_back(&self) -> WriteBack {
+        self.0.write_back()
     }
     fn source(&self) -> *const () {
         Arc::as_ptr(&self.0).cast()
@@ -298,6 +306,11 @@ pub(crate) struct DirtySource {
 }
 
 impl DirtySource {
+    /// [`DirtyPages::write_back`] of its source.
+    pub(crate) fn write_back(&self) -> WriteBack {
+        self.hook.write_back()
+    }
+
     /// Whether `other`'s stamps, writers and watches are this source's: the caller's same
     /// source's, or sources of one log ([`DirtyPages::log_identity`]).
     fn shares_log(&self, other: &DirtySource) -> bool {
@@ -426,6 +439,8 @@ pub(crate) struct ShadowLog {
     /// may run after work submitted later, until each completes: while any does, the hold stays
     /// let go of and no copy in counts on it ([`DirtyShadows::planned`]).
     unsettled: AtomicU64,
+    /// Whether it owns deferred rows (`deferred.rs`): its watch is kept while it does.
+    owns_deferred: AtomicBool,
 }
 
 /// Another texture's home over the same host bytes as a shadow, through another buffer
@@ -642,7 +657,8 @@ impl ShadowLog {
     /// Let go of its watch where no copy in used it for [`IDLE_WATCH_NANOS`] by `now`, and of
     /// its hold with it: the watch, for the caller to drop once it let go of the logs.
     fn idle_watch(&self, now: u64) -> Option<Box<dyn Send + Sync>> {
-        if now.saturating_sub(self.last_used.load(Ordering::Relaxed)) < IDLE_WATCH_NANOS {
+        let idle = now.saturating_sub(self.last_used.load(Ordering::Relaxed)) >= IDLE_WATCH_NANOS;
+        if !idle || self.owns_deferred.load(Ordering::Relaxed) {
             return None;
         }
         let watch = lock(&self.watch).take()?;
@@ -733,6 +749,8 @@ fn print_census(lines: &[String]) {
 #[derive(Default)]
 pub(crate) struct DirtyShadows {
     logs: Mutex<Vec<Arc<ShadowLog>>>,
+    /// The deferred rows of homes over pages whose source writes back on request.
+    deferred: Arc<deferred::Deferred>,
     /// Whether any log was ever made: a command buffer collects its writes only then.
     any: AtomicBool,
     tally: Arc<DirtyTally>,
@@ -758,6 +776,13 @@ pub(crate) struct DirtyTally {
     pub(crate) watched_bytes: AtomicU64,
     pub(crate) watched_bytes_released: AtomicU64,
     pub(crate) from_siblings: AtomicU64,
+    pub(crate) deferred_rows: AtomicU64,
+    pub(crate) flushes: AtomicU64,
+    pub(crate) write_back_bytes: AtomicU64,
+    pub(crate) lost_rows: AtomicU64,
+    pub(crate) unordered: AtomicU64,
+    pub(crate) flushes_unfinished: AtomicU64,
+    pub(crate) deferrals_refused: AtomicU64,
     pub(crate) wait_nanos: AtomicU64,
 }
 
@@ -838,6 +863,7 @@ impl DirtyShadows {
             truth: offsets.clone(),
             watch: Mutex::new(Some(source.hook.watch(offsets.clone()))),
             last_used: AtomicU64::new(now),
+            owns_deferred: AtomicBool::new(false),
             tally: Arc::clone(&self.tally),
             census: Census::default(),
             hold: Mutex::new(Hold::default()),
@@ -859,6 +885,9 @@ impl DirtyShadows {
     /// kept unsettled may be taken again; where it failed, the holds its copies in set are let go
     /// of, its copies having perhaps not run.
     pub(crate) fn completed(&self, commit: &mut DirtyCommit, failed: bool) {
+        if let Some(reach) = &commit.reach {
+            reach.done();
+        }
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
         }
@@ -890,11 +919,18 @@ impl DirtyShadows {
     }
 
     /// `commit`'s gates, taken out as its command buffer completed: their siblings' images and
-    /// buffers (`Sibling`), which the command buffer's object would hold as long as the program
-    /// keeps it. The caller drops them once it let go of the record's lock, as a gate may hold a
-    /// buffer's last handle, whose going runs its deallocator.
-    pub(crate) fn let_go(&self, commit: &mut DirtyCommit) -> Vec<Arc<CopyInGate>> {
-        std::mem::take(&mut commit.gates)
+    /// buffers (`Sibling`), and the copies back's homes' (`deferred.rs`), which the command
+    /// buffer's object would hold as long as the program keeps it. The caller drops them once it
+    /// let go of the record's lock, as a gate may hold a buffer's last handle, whose going runs
+    /// its deallocator.
+    pub(crate) fn let_go(
+        &self,
+        commit: &mut DirtyCommit,
+    ) -> (Vec<Arc<CopyInGate>>, Vec<Arc<BackGate>>) {
+        (
+            std::mem::take(&mut commit.gates),
+            std::mem::take(&mut commit.backs),
+        )
     }
 
     /// The log kept for `copies`, where its copies in made one.
@@ -948,9 +984,13 @@ impl DirtyShadows {
     /// submitted before it and before every one after (the copy's read of it,
     /// `EncoderCore::shadow_copies`), so the image holds the bytes as of that stamp but for the
     /// pages other writers changed since, which the copy takes from the pages.
-    fn base(&self, gate: &CopyInGate) -> Option<Base> {
+    fn base(&self, gate: &CopyInGate, owner: Option<&Arc<ShadowLog>>) -> Option<Base> {
         let sibling = gate.sibling.as_ref()?;
         let log = self.kept(&sibling.copies)?;
+        // Over deferred rows, only their owner's image.
+        if owner.is_some_and(|owner| !Arc::ptr_eq(owner, &log)) {
+            return None;
+        }
         // Its stamp and writer are asked of this log's source, of the same host bytes.
         let alike = (gate.log.source).shares_log(&log.source) && gate.log.host() == log.host();
         if !alike || log.unsettled.load(Ordering::Acquire) > 0 {
@@ -1017,7 +1057,13 @@ impl DirtyShadows {
         // A log in use until its command buffers are submitted: one encoded long before keeps
         // its watch while it waits (`IDLE_WATCH_NANOS`).
         let now = gpu_time::host_nanos();
+        // Its copies in and copies back in its order: a copy back decides what the copies in
+        // after it find deferred.
+        let mut backs = commit.backs.iter().peekable();
         for gate in &commit.gates {
+            while let Some(back) = backs.next_if(|back| back.seq < gate.seq) {
+                self.plan_back(back, commit.reach.as_ref());
+            }
             gate.log.last_used.fetch_max(now, Ordering::Relaxed);
             let Some(stamp) = *lock(&gate.stamp) else {
                 continue;
@@ -1029,23 +1075,42 @@ impl DirtyShadows {
                 (_, _, true) => (None, Whole::Unsettled),
                 _ => (gate.log.hold(), Whole::NoHold),
             };
+            // Deferred rows over its bytes another home owns come from that home's image, never
+            // from the pages: its own hold counts for nothing of them (`deferred.rs`).
+            let skip = self.deferred.skip(&gate.log);
+            let foreign = skip
+                .as_ref()
+                .filter(|skip| !Arc::ptr_eq(&skip.owner, &gate.log));
+            let since = since.filter(|_| foreign.is_none());
             let base = match (since, unheld) {
-                (None, Whole::NoHold) => self.base(gate),
+                (None, Whole::NoHold) => self.base(gate, foreign.map(|skip| &skip.owner)),
                 _ => None,
+            };
+            let skip = match (foreign, &base) {
+                (Some(_), None) => {
+                    self.tally.unordered.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                _ => skip,
             };
             *lock(&gate.decision) = Some(Decision {
                 since,
                 stamp,
                 unheld,
                 base,
+                skip,
             });
+        }
+        for back in backs {
+            self.plan_back(back, commit.reach.as_ref());
         }
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
         for log in &logs {
             let Some(copies) = log.copies.upgrade() else {
                 continue;
             };
-            if !commit.wrote_over(&copies) {
+            // A flush writes its owner's image into the pages: its hold stands (`deferred.rs`).
+            if !commit.wrote_over(&copies) || commit.flushes(&copies) {
                 continue;
             }
             log.set_hold(None);
@@ -1097,6 +1162,11 @@ impl DirtyShadows {
 pub(crate) struct DirtyCommit {
     written: Vec<Use<ResourceKey>>,
     gates: Vec<Arc<CopyInGate>>,
+    /// Its gated copies back (`deferred.rs`), and the order of every gate so far.
+    backs: Vec<Arc<BackGate>>,
+    seq: u32,
+    /// The host bytes its commands reach another way than through a home (`deferred.rs`).
+    reach: Option<Arc<deferred::Reach>>,
     wrote: Vec<(Arc<ShadowLog>, Range<u64>)>,
     unsettling: Vec<Arc<ShadowLog>>,
     /// The logs of the shadows its end held whole with no gated copy in ([`DirtyShadows::stamped`]).
@@ -1136,6 +1206,9 @@ impl DirtyCommit {
     ) -> Arc<CopyInGate> {
         let gate = Arc::new(CopyInGate {
             _counted: crate::live::Counted::new(crate::live::Kind::CopyInGate),
+            seq: self.next_seq(),
+            deferred: Arc::clone(&shadows.deferred),
+            emptied: Mutex::new(Vec::new()),
             log,
             texel,
             tally: Arc::clone(&shadows.tally),
@@ -1158,13 +1231,19 @@ impl DirtyCommit {
     /// Whether it holds a gated copy in, whose regions its submission decides
     /// ([`DirtyShadows::planned`]): its replay waits for that (`Replays::defer`).
     pub(crate) fn gated(&self) -> bool {
-        !self.gates.is_empty()
+        !self.gates.is_empty() || !self.backs.is_empty()
+    }
+
+    /// The next gate's place in the command buffer's order.
+    fn next_seq(&mut self) -> u32 {
+        self.seq += 1;
+        self.seq
     }
 }
 
 /// A shadow's copy in recorded with what its submission decides ([`DirtyShadows::planned`]): the
 /// stamp its log's hold stood at, where it held one, and the stamp it syncs to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Decision {
     since: Option<DirtyStamp>,
     stamp: DirtyStamp,
@@ -1173,6 +1252,8 @@ struct Decision {
     /// Where `since` is `None` for want of a hold, a sibling's image held at a stamp
     /// ([`Sibling`]).
     base: Option<Base>,
+    /// The deferred rows over its bytes, which it takes not from the pages (`deferred.rs`).
+    skip: Option<deferred::Skip>,
 }
 
 /// A copy in of a shadow over logged host pages, its regions decided as its command buffer's
@@ -1181,6 +1262,13 @@ struct Decision {
 /// the rows of the pages changed since the hold.
 pub(crate) struct CopyInGate {
     _counted: crate::live::Counted,
+    /// Its place in its command buffer's order.
+    seq: u32,
+    /// The device's deferred rows (`deferred.rs`).
+    deferred: Arc<deferred::Deferred>,
+    /// The group of deferred rows its CPU's rows emptied, which holds its owner's image and
+    /// buffer: dropped with the gate, past the locks its replay ran under.
+    emptied: Mutex<Vec<deferred::Group>>,
     log: Arc<ShadowLog>,
     /// The bytes of one texel in the buffer.
     texel: u64,
@@ -1278,22 +1366,51 @@ impl CopyInGate {
         let total = bytes(whole);
         let census = &self.log.census;
         census.copies.fetch_add(1, Ordering::Relaxed);
-        let every_row = |out: &mut Vec<vk::BufferImageCopy>, why: Whole| {
+        // Every row, but deferred ones where any are (`deferred.rs`), after the base where one is.
+        let every_row = |out: &mut Vec<vk::BufferImageCopy>,
+                         why: Whole,
+                         skip: Option<&[Range<u32>]>,
+                         taken: Option<vk::Image>| {
             census.whole(why);
             out.clear();
-            out.extend_from_slice(whole);
-            census.bytes_in.fetch_add(total, Ordering::Relaxed);
-            (total, total, None)
+            match (skip, whole) {
+                (Some(skip), [region]) if !skip.is_empty() || taken.is_some() => {
+                    let top = u32::try_from(region.image_offset.y).unwrap_or(0);
+                    let mut rows: Vec<Range<u32>> =
+                        std::iter::once(top..top + region.image_extent.height).collect();
+                    for cut in skip {
+                        deferred::subtract(&mut rows, cut);
+                    }
+                    let rows: Vec<Range<u32>> = (rows.iter())
+                        .map(|row| row.start - top..row.end - top)
+                        .collect();
+                    deferred::row_regions(region, &rows, self.texel, out);
+                    let copied = bytes(out);
+                    census.bytes_in.fetch_add(copied, Ordering::Relaxed);
+                    (total, copied, taken)
+                }
+                _ => {
+                    out.extend_from_slice(whole);
+                    census.bytes_in.fetch_add(total, Ordering::Relaxed);
+                    (total, total, None)
+                }
+            }
         };
-        let Some(decision) = *lock(&self.decision) else {
-            return every_row(out, Whole::Unplanned);
+        let Some(decision) = lock(&self.decision).clone() else {
+            // Its own deferred rows stay in its image.
+            let own = (self.deferred.skip(&self.log))
+                .filter(|skip| Arc::ptr_eq(&skip.owner, &self.log))
+                .map(|skip| skip.rows);
+            return every_row(out, Whole::Unplanned, own.as_deref(), None);
         };
         let Decision {
             since,
             stamp,
             unheld,
             base,
+            skip,
         } = decision;
+        let skip_rows = skip.as_ref().map(|skip| skip.rows.clone());
         // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
         // submission set to its own stamp ([`DirtyShadows::planned`]).
         let published = self.log.source.published(stamp, &self.tally);
@@ -1311,16 +1428,39 @@ impl CopyInGate {
         let (since, writer, taken) = match (since, base) {
             (Some(since), _) => (since, self.log.writer, None),
             (None, Some(base)) => (base.since, base.writer, Some(base.image)),
-            (None, None) => return every_row(out, unheld),
+            (None, None) => return every_row(out, unheld, skip_rows.as_deref(), None),
         };
         if !published {
-            return every_row(out, Whole::Unpublished);
+            return every_row(out, Whole::Unpublished, skip_rows.as_deref(), taken);
         }
         let mut runs = Vec::new();
         (self.log.source.hook).changed_except(since, writer, &mut runs);
+        // Rows the CPU wrote since that a home deferred: the CPU's win them (`deferred.rs`).
+        let skip_rows = match (&skip, skip_rows) {
+            (Some(skip), Some(mut rows)) => {
+                let changed = self.run_rows(whole, &runs);
+                let won: Vec<Range<u32>> = (changed.iter())
+                    .flat_map(|c| {
+                        (rows.iter())
+                            .map(move |r| c.start.max(r.start)..c.end.min(r.end))
+                            .filter(|w| w.start < w.end)
+                    })
+                    .collect();
+                if !won.is_empty() {
+                    let (lost, emptied) = self.deferred.won(&skip.owner, &won, skip.epoch);
+                    lock(&self.emptied).extend(emptied);
+                    self.tally.lost_rows.fetch_add(lost, Ordering::Relaxed);
+                    for row in &won {
+                        deferred::subtract(&mut rows, row);
+                    }
+                }
+                Some(rows)
+            }
+            _ => None,
+        };
         let banded = whole.iter().all(|region| self.bands(region, &runs, out));
         if !banded || out.len() > REGIONS {
-            return every_row(out, Whole::MostRows);
+            return every_row(out, Whole::MostRows, skip_rows.as_deref(), taken);
         }
         let copied = bytes(out);
         census.bytes_in.fetch_add(copied, Ordering::Relaxed);
@@ -1330,6 +1470,36 @@ impl CopyInGate {
             (None, false) => 0,
         };
         (total, copied, taken)
+    }
+
+    /// The image's rows of `whole` that the source's changed `runs` meet.
+    fn run_rows(&self, whole: &[vk::BufferImageCopy], runs: &[Range<u64>]) -> Vec<Range<u32>> {
+        let mut rows = Vec::new();
+        for region in whole {
+            let extent = region.image_extent;
+            let row_texels = match region.buffer_row_length {
+                0 => extent.width,
+                row => row,
+            };
+            let pitch = u64::from(row_texels) * self.texel;
+            if pitch == 0 {
+                continue;
+            }
+            let first = region.buffer_offset.wrapping_add(self.log.delta);
+            let height = u64::from(extent.height);
+            let end = first + height * pitch;
+            let top = u32::try_from(region.image_offset.y).unwrap_or(0);
+            for run in runs {
+                let (start, stop) = (run.start.max(first), run.end.min(end));
+                if start >= stop {
+                    continue;
+                }
+                let first_row = ((start - first) / pitch) as u32;
+                let last_row = ((stop - first).div_ceil(pitch)).min(height) as u32;
+                rows.push(top + first_row..top + last_row);
+            }
+        }
+        rows
     }
 
     /// The full-width bands of `region`'s rows that the source's changed `runs` meet, into
@@ -1390,5 +1560,57 @@ impl CopyInGate {
             ..*region
         }));
         true
+    }
+}
+
+#[cfg(test)]
+impl CopyInGate {
+    /// A gate of no shadow over a source that logs nothing, for tests of what holds gates.
+    pub(crate) fn for_test() -> Arc<CopyInGate> {
+        struct Nothing;
+        impl DirtyPages for Nothing {
+            type Watch = ();
+            fn watch(&self, _range: Range<u64>) {}
+            fn request(&self) -> DirtyStamp {
+                DirtyStamp(0)
+            }
+            fn wait(&self, _stamp: DirtyStamp) -> bool {
+                true
+            }
+            fn changed(&self, _since: DirtyStamp, _out: &mut Vec<Range<u64>>) {}
+            fn wrote(&self, _range: Range<u64>) {}
+        }
+        let source = DirtySource::new(hook(Arc::new(Nothing)), 0);
+        let tally = Arc::new(DirtyTally::default());
+        let log = Arc::new(ShadowLog {
+            copies: Weak::new(),
+            source,
+            writer: NonZeroU64::MIN,
+            raw: vk::Buffer::null(),
+            delta: 0,
+            truth: 0..0,
+            watch: Mutex::new(None),
+            last_used: AtomicU64::new(0),
+            tally: Arc::clone(&tally),
+            census: Census::default(),
+            hold: Mutex::new(Hold::default()),
+            unsettled: AtomicU64::new(0),
+            owns_deferred: AtomicBool::new(false),
+        });
+        Arc::new(CopyInGate {
+            _counted: crate::live::Counted::new(crate::live::Kind::CopyInGate),
+            seq: 0,
+            deferred: Arc::default(),
+            emptied: Mutex::new(Vec::new()),
+            log,
+            texel: 4,
+            written_before: false,
+            tally,
+            stamp: Mutex::new(None),
+            decision: Mutex::new(None),
+            held_at: Mutex::new(None),
+            held: AtomicBool::new(false),
+            sibling: None,
+        })
     }
 }

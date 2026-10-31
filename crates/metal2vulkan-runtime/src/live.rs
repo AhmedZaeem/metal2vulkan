@@ -1,5 +1,6 @@
 //! Counts of the runtime's live objects that hold device memory or the device: devices, buffers,
-//! images, shadows and their texels, queues, command buffers, recorder logs and copy-in gates. A
+//! images, shadows and their texels, queues, command buffers, recorder logs, copy-in gates, and
+//! the deferred write-backs' gates and groups. A
 //! run that looks for what grows reads them (`WorkCounts::live_*`); nothing decides by them.
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -16,9 +17,13 @@ pub(crate) enum Kind {
     CommandBuffer,
     Log,
     CopyInGate,
+    /// A deferred write-back's gated copy back (`dirty_pages/deferred.rs`).
+    BackGate,
+    /// A group of deferred rows, which holds its owner's image and buffer.
+    Group,
 }
 
-const KINDS: usize = 9;
+const KINDS: usize = 11;
 
 static COUNTS: [AtomicI64; KINDS] = [const { AtomicI64::new(0) }; KINDS];
 

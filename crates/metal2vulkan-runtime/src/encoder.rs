@@ -51,7 +51,7 @@ use super::residency::{Residency, Used};
 use super::resource::ResourceKey;
 use super::retained::Retained;
 use super::row_copies::RowCopies;
-use super::shadow::{CopyCause, ShadowCopy, ShadowSync, ShadowUse, Step, Within};
+use super::shadow::{CopyCause, CopyGate, ShadowCopy, ShadowSync, ShadowUse, Step, Within};
 use super::shadow_copy_in::CopyIn;
 use super::shadow_merge::ShadowMerge;
 use super::sparse::encoder::SparseUpdate;
@@ -266,6 +266,8 @@ pub(super) struct EncoderCore {
     /// The uses of the command [`note_reaching`](Self::note_reaching) notes, with those of the
     /// host memory beside them ([`aliased`](Self::aliased)): kept, so a draw makes no vector.
     aliased_uses: Vec<Use<ResourceKey>>,
+    /// Its shadows' copies are recording: their uses reach no bytes another way (`reach`).
+    shadow_copying: bool,
     /// The open runs of the index gather pass ([`gather`](Self::gather)), which record before
     /// the encoder's next command, and before its `VkCommandBuffer` ends.
     gathers: GatherRuns,
@@ -493,6 +495,7 @@ impl EncoderCore {
             twin_writes: Vec::new(),
             unattached_as_called: false,
             aliased_uses: Vec::new(),
+            shadow_copying: false,
             gathers: GatherRuns::default(),
             id: CORES.fetch_add(1, Ordering::Relaxed),
             replaying: false,
@@ -576,6 +579,7 @@ impl EncoderCore {
             twin_writes: Vec::new(),
             unattached_as_called: false,
             aliased_uses: Vec::new(),
+            shadow_copying: false,
             gathers: GatherRuns::default(),
             id: CORES.fetch_add(1, Ordering::Relaxed),
             // A segment a rebind records again, its command buffer committed.
@@ -1115,6 +1119,7 @@ impl EncoderCore {
         // texture is no longer carried, whatever this encoder uses (`shadow::ShadowCarry`).
         self.shadows.wrote(tracked);
         self.open.command_buffer.note_dirty(tracked);
+        self.reach(tracked);
         let barrier = self.uses.barrier(tracked, reach);
         self.uses.record_reaching(stages, tracked, barrier, reach);
         if barrier.is_some() {
@@ -1342,6 +1347,7 @@ impl EncoderCore {
             ));
         }
         self.observe_fresh(uses, &[]);
+        self.reach(uses);
         self.hold_resident();
         let Some(noted) = noted else {
             self.record_aliased(stages, uses);
@@ -1576,6 +1582,84 @@ impl EncoderCore {
     /// moves out of a staging buffer are a copy of rows (`row_copies.rs`); the command buffer
     /// retains each until it completes.
     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
+        self.shadow_copies_as(copies, crate::dirty_pages::BackKind::End);
+    }
+
+    /// A flush of the deferred rows `owners` own (`Device::write_back_deferred`): a copy back of
+    /// each, gated to those rows (`dirty_pages/deferred.rs`).
+    pub(crate) fn flush_deferred(&mut self, owners: &[Arc<crate::shadow::ShadowCopies>]) {
+        let copies: Vec<ShadowCopy> = (owners.iter())
+            .map(|owner| ShadowCopy::flush(Arc::clone(owner)))
+            .collect();
+        self.shadow_copies_as(&copies, crate::dirty_pages::BackKind::Flush);
+    }
+
+    /// The gate of `copy`'s copy back, a home's whose writes back are deferred, as `kind`
+    /// (`dirty_pages/deferred.rs`); `None` where its log, image or buffer is gone.
+    fn back_gate(
+        &mut self,
+        device: &Device,
+        copy: &ShadowCopy,
+        kind: crate::dirty_pages::BackKind,
+    ) -> Option<Arc<crate::dirty_pages::BackGate>> {
+        let shadows = &device.shared().dirty;
+        let log = shadows.kept(&copy.copies)?;
+        // A flush holds what the group holds, whose home may have gone.
+        let keep: Arc<dyn Send + Sync> = match kind {
+            crate::dirty_pages::BackKind::Flush => shadows.deferred_keep(&copy.copies)?,
+            crate::dirty_pages::BackKind::End => {
+                let image = device.home_image(&copy.copies)?;
+                Arc::new((image, copy.copies.rebound_buffer()?))
+            }
+        };
+        let mut commit = self.open.command_buffer.dirty();
+        Some(shadows.back_gate(&mut commit, (log, Arc::clone(&copy.copies), keep), kind))
+    }
+
+    /// [`shadow_copies`](Self::shadow_copies), its homes' deferred copies back gated as `kind`.
+    fn shadow_copies_as(&mut self, copies: &[ShadowCopy], kind: crate::dirty_pages::BackKind) {
+        // A shadow's copies reach its truth through the home, not another way.
+        let copying = std::mem::replace(&mut self.shadow_copying, true);
+        self.record_shadow_copies(copies, kind);
+        self.shadow_copying = copying;
+    }
+
+    /// Note that a command of `uses`, not a shadow's copy, reaches the host bytes its buffers
+    /// over host pages lie over, where a source writes back on request (`dirty_pages/deferred.rs`):
+    /// its command buffer is in flight over them from now on, and the deferred rows over them are
+    /// written back first, waited for, so it reads the GPU's writes.
+    fn reach(&mut self, uses: &[Use<ResourceKey>]) {
+        let device = self.device().clone();
+        let shared = device.shared();
+        if self.shadow_copying || !shared.dirty.on_request_seen() {
+            return;
+        }
+        let ranges: Vec<std::ops::Range<u64>> = (uses.iter())
+            .filter_map(|used| {
+                let UseRange::Bytes(range) = &used.range else {
+                    return None;
+                };
+                let (start, length) = shared.aliases.host_of(used.key)?;
+                let (from, to) = (range.start.min(length), range.end.min(length));
+                (from < to).then(|| start + from..start + to)
+            })
+            .collect();
+        if ranges.is_empty() {
+            return;
+        }
+        shared
+            .dirty
+            .reach(&mut self.open.command_buffer.dirty(), &ranges);
+        for range in &ranges {
+            if shared.dirty.deferred_over(range) {
+                // A failure leaves the rows deferred; the command reads the pages as they are.
+                let _ = device.flush_deferred(Some(range.clone()));
+            }
+        }
+    }
+
+    /// [`shadow_copies_as`](Self::shadow_copies_as)'s copies.
+    fn record_shadow_copies(&mut self, copies: &[ShadowCopy], kind: crate::dirty_pages::BackKind) {
         let device = self.device().clone();
         let mut run = ShadowRun::default();
         // The keeps a dispatch at their copy in took, which record nothing, and those that copy
@@ -1601,17 +1685,29 @@ impl EncoderCore {
                 self.retain(both);
                 continue;
             }
-            // A copy back or merge into host pages a consumer logs is reported to the log as the
-            // shadow's own at the commit (`dirty_pages.rs`).
-            if let Some((log, bytes)) = copy.written_log(&device) {
-                self.open.command_buffer.dirty().wrote_back(log, bytes);
-            }
             // A shadow takes the view a dispatch reads on a device that dispatches alone.
             let dispatched = copy.dispatched(&device);
             let rows = match dispatched {
                 Some(_) => None,
                 None => copy.staged_back(&device),
             };
+            // A home's copy back whose writes back are deferred takes the rows its submission
+            // decides (`dirty_pages/deferred.rs`); it reports no write.
+            let deferring = matches!(copy.step, Step::Back)
+                && dispatched.is_none()
+                && rows.is_none()
+                && copy.copies.defers();
+            let back_gate = deferring
+                .then(|| self.back_gate(&device, copy, kind))
+                .flatten();
+            // A copy back or merge into host pages a consumer logs is reported to the log as the
+            // shadow's own at the commit (`dirty_pages.rs`).
+            if let (None, Some((log, bytes))) = (&back_gate, copy.written_log(&device)) {
+                let tally = device.shared().dirty.tally();
+                let span = bytes.end.saturating_sub(bytes.start);
+                tally.write_back_bytes.fetch_add(span, Ordering::Relaxed);
+                self.open.command_buffer.dirty().wrote_back(log, bytes);
+            }
             let (stages, mut uses) = match &dispatched {
                 Some(_) => (
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
@@ -1629,8 +1725,10 @@ impl EncoderCore {
                 None => copy.gate_log(&device).map(|(log, texel)| {
                     let shadows = &device.shared().dirty;
                     // Another texture's home over the same bytes, whose image the copy may take:
-                    // read by it, so the tracker orders it against that image's writes.
-                    let sibling = device.sibling_home(&copy.copies, log.host().start);
+                    // read by it, so the tracker orders it against that image's writes. The
+                    // owner of deferred rows there first (`dirty_pages/deferred.rs`).
+                    let sibling = (shadows.deferred_sibling(&log, &copy.copies))
+                        .or_else(|| device.sibling_home(&copy.copies, log.host().start));
                     if let Some(sibling) = &sibling {
                         uses.push(Use::reads(
                             sibling.copies.shadow_key,
@@ -1666,7 +1764,11 @@ impl EncoderCore {
                     kept.set(true);
                 }
                 // SAFETY: as above; the rows are the copy's own, made just now.
-                None => unsafe { copy.record_gated(device, raw, rows.as_ref(), gate) },
+                None => unsafe {
+                    let gate = (gate.clone().map(CopyGate::In))
+                        .or_else(|| back_gate.clone().map(CopyGate::Back));
+                    copy.record_gated(device, raw, rows.as_ref(), gate)
+                },
             };
             self.shadow_command(&mut run, (stages, &uses, copy.writes_truth()), record);
             if kept.get() {

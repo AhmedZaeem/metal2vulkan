@@ -512,6 +512,9 @@ impl Device {
             // The caller's log of the pages' writes stays with these pages too (`dirty_pages.rs`).
             if let Some(dirty) = dirty {
                 if let Some(pages) = buffer.host_pages() {
+                    if dirty.write_back() == crate::WriteBack::OnRequest {
+                        self.shared().dirty.saw_on_request();
+                    }
                     pages.keep_dirty(dirty);
                 }
             }
@@ -614,6 +617,9 @@ impl Device {
         // looked at (their lock, `WorkCounts::no_copy_lies_read`) only for memory that carries one.
         if let Some(dirty) = dirty {
             if let Some(pages) = buffer.host_pages() {
+                if dirty.write_back() == crate::WriteBack::OnRequest {
+                    self.shared().dirty.saw_on_request();
+                }
                 pages.keep_dirty(dirty);
             }
         }
@@ -867,6 +873,9 @@ impl Device {
         }
         // The caller's log of the new pages' writes stays with them (`dirty_pages.rs`).
         if let Some(dirty) = dirty {
+            if dirty.write_back() == crate::WriteBack::OnRequest {
+                self.shared().dirty.saw_on_request();
+            }
             pages.keep_dirty(dirty);
         }
         let (old, again) = shared
@@ -1383,6 +1392,9 @@ impl Device {
             pages.set_copied(copied);
             // The caller's log of the pages' writes stays with them (`dirty_pages.rs`).
             if let Some(dirty) = dirty {
+                if dirty.write_back() == crate::WriteBack::OnRequest {
+                    self.shared().dirty.saw_on_request();
+                }
                 pages.keep_dirty(dirty);
             }
         }

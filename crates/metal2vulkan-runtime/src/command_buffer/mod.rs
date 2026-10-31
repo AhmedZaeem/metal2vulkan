@@ -2467,6 +2467,9 @@ impl CommandBuffer {
     /// [`commit`](Self::commit) for `call`, or, with `failure`,
     /// [`commit_failed`](Self::commit_failed).
     fn commit_as(&self, call: &'static str, failure: Option<CommitFailure>) -> Result<(), Error> {
+        // The GPU's deferred writes of homes no texture holds any more go back now
+        // (`dirty_pages/deferred.rs`).
+        self.device().flush_orphans();
         // Left to wait for the last render encoder's end, where its call left it to the device's
         // lowering thread and the thread has not lowered it, or for the commits left so.
         if failure.is_none() && self.queue_commit(call)? {

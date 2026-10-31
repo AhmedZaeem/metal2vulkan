@@ -222,6 +222,7 @@ mod visibility;
 mod word_fill;
 mod live;
 mod work_counts;
+mod write_back;
 mod wrapped_buffer;
 mod ycbcr;
 mod ycbcr_device;

@@ -164,7 +164,7 @@ pub(super) mod heap_two_planes;
 pub(crate) mod held_depth;
 mod homes;
 pub(crate) use homes::process_homes;
-pub(crate) use homes::shadow_bytes;
+pub(crate) use homes::{shadow_bytes, ShadowLayout};
 pub(crate) mod host_copy;
 pub(crate) mod host_shadow;
 mod in_place_image;
@@ -2554,6 +2554,16 @@ impl Device {
             *free.get_or_insert(0u64) += budget.saturating_sub(*usage);
         }
         free
+    }
+
+    /// Whether a texture still holds the home whose copies are `copies` (`texture/homes.rs`).
+    pub(crate) fn home_held(&self, copies: &Arc<ShadowCopies>) -> bool {
+        self.shared().textures.homes.held(copies)
+    }
+
+    /// The image of the home whose copies are `copies` (`texture/homes.rs`).
+    pub(crate) fn home_image(&self, copies: &Arc<ShadowCopies>) -> Option<Arc<dyn Send + Sync>> {
+        self.shared().textures.homes.image_of(copies)
     }
 
     /// Another texture's live home over the same host bytes as `copies`, whose first texel lies

@@ -3400,6 +3400,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                homed: std::sync::atomic::AtomicBool::new(false),
                 _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
@@ -3502,6 +3503,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                homed: std::sync::atomic::AtomicBool::new(false),
                 _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
@@ -3581,6 +3583,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                homed: std::sync::atomic::AtomicBool::new(false),
                 _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {

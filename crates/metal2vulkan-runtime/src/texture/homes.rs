@@ -563,6 +563,22 @@ impl Registry {
         );
     }
 
+    /// Whether a texture still holds the home whose copies are `copies`: its texels live, which
+    /// nothing a deferred write-back keeps holds (`dirty_pages/deferred.rs`).
+    fn held(&self, copies: &Arc<ShadowCopies>) -> bool {
+        let homes = lock(&self.homes);
+        (homes.iter()).any(|home| Arc::ptr_eq(&home.copies, copies) && home.held())
+    }
+
+    /// The image of the home whose copies are `copies`, which a deferred write-back holds
+    /// (`dirty_pages/deferred.rs`).
+    fn image_of(&self, copies: &Arc<ShadowCopies>) -> Option<Arc<dyn Send + Sync>> {
+        let homes = lock(&self.homes);
+        (homes.iter())
+            .find(|home| Arc::ptr_eq(&home.copies, copies))
+            .map(|home| -> Arc<dyn Send + Sync> { Arc::<Image>::clone(&home.image) })
+    }
+
     /// The storage of a live home of `key` whose image serves a texture planned as `plan`, marked
     /// shared; `None` where none does.
     fn take(&self, key: HomeKey, plan: &ImagePlan, texels: &Arc<Texels>) -> Option<Storage> {
@@ -623,6 +639,7 @@ impl Registry {
         }
         if homes.len() < HOMES {
             self.tally.made.fetch_add(1, Ordering::Relaxed);
+            copies.homed.store(true, Ordering::Relaxed);
             homes.push(Home {
                 key,
                 host: texels.host_bytes(),
@@ -650,6 +667,16 @@ impl ShadowHomes {
     /// [`Registry::pages_gone`].
     pub(super) fn pages_gone(&self) {
         self.inner.pages_gone();
+    }
+
+    /// [`Registry::held`].
+    pub(super) fn held(&self, copies: &Arc<ShadowCopies>) -> bool {
+        self.inner.held(copies)
+    }
+
+    /// [`Registry::image_of`].
+    pub(super) fn image_of(&self, copies: &Arc<ShadowCopies>) -> Option<Arc<dyn Send + Sync>> {
+        self.inner.image_of(copies)
     }
 
     /// [`Registry::tally`].

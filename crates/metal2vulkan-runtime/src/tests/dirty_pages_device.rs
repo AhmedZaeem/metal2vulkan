@@ -104,6 +104,8 @@ struct Log {
     /// The writers `changed_except` was asked to leave out, and `wrote_as` named.
     asked: Mutex<Vec<u64>>,
     named: Mutex<Vec<u64>>,
+    /// Its `write_back` is `OnRequest` while set.
+    on_request: AtomicBool,
 }
 
 impl Log {
@@ -135,6 +137,13 @@ impl DirtyPages for Log {
 
     fn publication_hold(&self) -> Option<Duration> {
         *self.hold.lock().unwrap()
+    }
+
+    fn write_back(&self) -> crate::WriteBack {
+        match self.on_request.load(Ordering::SeqCst) {
+            true => crate::WriteBack::OnRequest,
+            false => crate::WriteBack::Eager,
+        }
     }
 
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>) {
@@ -1182,4 +1191,291 @@ fn a_texture_over_another_buffer_of_the_bytes_copies_in_from_the_home() {
     drop((producer, reader));
     drop((first, second));
     drop(device);
+}
+
+/// A deferring home's test (`dirty_pages/deferred.rs`): two buffers over the same pages, whose log
+/// writes back on request, a pass's texture over the first, a sampled one over the second, a
+/// texture to sample into, and the inverting kernel; `None` off a discrete GPU.
+type Deferring = (
+    Scratch,
+    Host,
+    Device,
+    Arc<Log>,
+    Buffer,
+    Buffer,
+    Texture,
+    Texture,
+    Texture,
+    ComputePipelineState,
+);
+
+/// The rows' bytes of a deferring test's textures.
+const DEFERRING_PITCH: u64 = 320;
+
+/// What lives now of what keeps devices alive (`live.rs`), for a run that looks for a leak.
+fn live_line() -> String {
+    use crate::live::{live, Kind};
+    let kinds = [
+        Kind::Device,
+        Kind::Log,
+        Kind::CopyInGate,
+        Kind::BackGate,
+        Kind::Group,
+        Kind::Buffer,
+        Kind::Image,
+        Kind::Queue,
+        Kind::CommandBuffer,
+        Kind::ShadowCopies,
+        Kind::Texels,
+    ];
+    format!("{:?}", kinds.map(|kind| (kind, live(kind))))
+}
+
+fn deferring(name: &str) -> Option<Deferring> {
+    eprintln!("DIRTY-PAGES: live before {name}: {}", live_line());
+    let scratch = Scratch::new(name);
+    let host = Host::new();
+    let device = device(&scratch.0);
+    let log = Arc::new(Log::default());
+    log.on_request.store(true, Ordering::SeqCst);
+    let (Some(first), Some(second)) = (
+        over_logged(&device, &host, &log),
+        over_logged(&device, &host, &log),
+    ) else {
+        return None;
+    };
+    host.fill(0x1010_1010);
+    let mut rendered = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    rendered.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let producer = first.new_texture(&rendered, 0, DEFERRING_PITCH).unwrap();
+    let mut sampled = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    sampled.usage = TextureUsage::SHADER_READ;
+    let reader = second.new_texture(&sampled, 0, DEFERRING_PITCH).unwrap();
+    if device.work_counts().device_copy_textures == 0 {
+        eprintln!("DIRTY-PAGES: no device copies (an integrated GPU)");
+        return None;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    Some((
+        scratch, host, device, log, first, second, producer, reader, target, invert,
+    ))
+}
+
+/// The first texel of `row` of a deferring test's pages, read by the CPU.
+fn page(buffer: &Buffer, row: u64) -> [u8; 4] {
+    let bytes = buffer.contents().unwrap().as_ptr();
+    let mut texel = [0u8; 4];
+    // SAFETY: a texel of the buffer's bytes, which no command uses now.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.add((row * DEFERRING_PITCH) as usize),
+            texel.as_mut_ptr(),
+            4,
+        )
+    };
+    texel
+}
+
+#[test]
+fn a_deferred_home_leaves_the_pages_until_the_host_asks() {
+    let Some((_scratch, _host, device, _log, first, _second, producer, _reader, target, invert)) =
+        deferring("dirty-pages-deferred")
+    else {
+        return;
+    };
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    let counts = device.work_counts();
+    eprintln!(
+        "DIRTY-PAGES: deferred rows {}, write-back bytes {}",
+        counts.write_back_rows_deferred, counts.write_back_bytes
+    );
+    assert!(
+        counts.write_back_rows_deferred > 0,
+        "the pass's rows deferred"
+    );
+    assert_eq!(
+        page(&first, 0),
+        [0x10; 4],
+        "the pass's red stays in the home"
+    );
+    run(&device, &invert, &producer, &target);
+    assert_eq!(
+        texel(&target, 0),
+        [0, 255, 255, 255],
+        "the home's red, sampled"
+    );
+    let flushes = || device.work_counts().write_back_flushes;
+    let before = flushes();
+    device.write_back_deferred(None).unwrap();
+    assert_eq!(flushes() - before, 1);
+    assert_eq!(page(&first, 0), [255, 0, 0, 255], "written back on request");
+    assert_eq!(
+        page(&first, 20),
+        [0x10; 4],
+        "the rows the pass did not write stay"
+    );
+    let before = flushes();
+    device.write_back_deferred(None).unwrap();
+    assert_eq!(flushes(), before, "nothing more to write");
+}
+
+#[test]
+fn a_reader_over_another_buffer_takes_deferred_rows_from_their_owner() {
+    let Some((_scratch, _host, device, _log, first, _second, producer, reader, target, invert)) =
+        deferring("dirty-pages-deferred-reader")
+    else {
+        return;
+    };
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(page(&first, 0), [0x10; 4], "deferred");
+    run(&device, &invert, &reader, &target);
+    let counts = device.work_counts();
+    assert_eq!(
+        texel(&target, 0),
+        [0, 255, 255, 255],
+        "the owner's red, not the pages'"
+    );
+    assert_eq!(
+        texel(&target, 20),
+        [0xef, 0xef, 0xef, 0x10],
+        "the pages' bytes elsewhere"
+    );
+    assert_eq!(counts.deferred_rows_unordered, 0);
+    assert_eq!(page(&first, 0), [0x10; 4], "still deferred");
+    // Deferred rows hold their device until written back.
+    device.write_back_deferred(None).unwrap();
+}
+
+#[test]
+fn an_unlocked_cpu_write_wins_its_deferred_rows() {
+    let Some((_scratch, _host, device, log, first, _second, producer, _reader, target, invert)) =
+        deferring("dirty-pages-deferred-cpu")
+    else {
+        return;
+    };
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    // A CPU write of row 2, which the pass deferred, told to the log.
+    let bytes = first.contents().unwrap().as_ptr();
+    // SAFETY: a row of the buffers' bytes, which no command uses now.
+    unsafe {
+        std::ptr::write_bytes(
+            bytes.add((2 * DEFERRING_PITCH) as usize),
+            0x5a,
+            (SIDE * 4) as usize,
+        )
+    };
+    log.told(2 * DEFERRING_PITCH..3 * DEFERRING_PITCH, 0);
+    run(&device, &invert, &producer, &target);
+    let counts = device.work_counts();
+    eprintln!(
+        "DIRTY-PAGES: lost rows {}",
+        counts.deferred_rows_lost_to_unlocked_cpu_writes
+    );
+    assert_eq!(
+        texel(&target, 2),
+        [0xa5, 0xa5, 0xa5, 0x5a],
+        "the CPU's row wins"
+    );
+    assert_eq!(
+        texel(&target, 0),
+        [0, 255, 255, 255],
+        "the pass's other rows stay"
+    );
+    assert_eq!(counts.deferred_rows_lost_to_unlocked_cpu_writes, 1);
+    device.write_back_deferred(None).unwrap();
+    assert_eq!(page(&first, 0), [255, 0, 0, 255], "written back");
+    assert_eq!(
+        page(&first, 2),
+        [0x5a; 4],
+        "the CPU's row is not written over"
+    );
+}
+
+#[test]
+fn a_copy_in_of_every_row_keeps_the_deferred_ones() {
+    let Some((_scratch, _host, device, log, _first, _second, producer, _reader, target, invert)) =
+        deferring("dirty-pages-deferred-whole")
+    else {
+        return;
+    };
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    // Its stamp unpublished: the copy in takes every row, but the deferred ones.
+    log.pending.store(true, Ordering::SeqCst);
+    run(&device, &invert, &producer, &target);
+    log.pending.store(false, Ordering::SeqCst);
+    assert_eq!(
+        texel(&target, 0),
+        [0, 255, 255, 255],
+        "the deferred red stays"
+    );
+    assert_eq!(
+        texel(&target, 20),
+        [0xef, 0xef, 0xef, 0x10],
+        "the pages' bytes elsewhere"
+    );
+    device.write_back_deferred(None).unwrap();
+}
+
+#[test]
+fn another_homes_write_goes_back_at_once_over_the_owners_rows() {
+    let Some((_scratch, _host, device, _log, first, second, producer, _reader, target, invert)) =
+        deferring("dirty-pages-deferred-two")
+    else {
+        return;
+    };
+    let mut rendered = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    rendered.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let other = second.new_texture(&rendered, 0, DEFERRING_PITCH).unwrap();
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(page(&first, 0), [0x10; 4], "the owner's red deferred");
+    draw_rows(&device, &other, [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(
+        page(&first, 0),
+        [0, 255, 0, 255],
+        "the other home's green, at once"
+    );
+    run(&device, &invert, &producer, &target);
+    assert_eq!(
+        texel(&target, 0),
+        [255, 0, 255, 255],
+        "the owner reads the newer green"
+    );
+    let before = device.work_counts().write_back_flushes;
+    device.write_back_deferred(None).unwrap();
+    let flushed = device.work_counts().write_back_flushes - before;
+    assert_eq!(flushed, 0, "nothing left deferred");
+    assert_eq!(page(&first, 0), [0, 255, 0, 255]);
+}
+
+#[test]
+fn a_home_no_texture_holds_writes_back_its_deferred_rows() {
+    let Some((_scratch, _host, device, _log, first, _second, producer, reader, target, invert)) =
+        deferring("dirty-pages-deferred-orphan")
+    else {
+        return;
+    };
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(page(&first, 0), [0x10; 4], "deferred");
+    let before = device.work_counts().write_back_flushes;
+    // The pass's texture goes.
+    drop(producer);
+    run(&device, &invert, &reader, &target);
+    // The reader's command buffer held the home as its sibling; the next commit, once it went,
+    // writes the rows back, unwaited.
+    run(&device, &invert, &reader, &target);
+    let flushed = std::time::Instant::now();
+    while page(&first, 0) != [255, 0, 0, 255] && flushed.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(device.work_counts().write_back_flushes - before, 1);
+    assert_eq!(
+        page(&first, 0),
+        [255, 0, 0, 255],
+        "written back as its home went"
+    );
+    assert_eq!(texel(&target, 0), [0, 255, 255, 255], "the reader's red");
 }

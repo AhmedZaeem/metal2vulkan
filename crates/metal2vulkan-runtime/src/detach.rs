@@ -115,6 +115,8 @@ impl Buffer {
     /// lost device, also while the call waits.
     pub fn detach_backing(&self) -> Result<bool, Error> {
         const CALL: &str = "detach_backing";
+        // The GPU's deferred writes of its bytes go back into its pages first.
+        self.device().flush_deferred_of(self);
         let Some(cell) = self.host_cell() else {
             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
         };
@@ -139,6 +141,10 @@ impl Heap {
     /// (`NotImplemented(DetachTextures)`), or out of memory for one; a lost device.
     pub fn detach_backing(&self) -> Result<bool, Error> {
         const CALL: &str = "detach_backing";
+        if let Some(own) = self.bytes() {
+            // As a buffer's detach does.
+            self.device().flush_deferred_of(own);
+        }
         let Some((own, cell)) = self
             .bytes()
             .and_then(|own| own.host_cell().map(|cell| (own, cell)))
