@@ -310,6 +310,16 @@ impl DirtySource {
         published
     }
 
+    /// The latest stamp the runtime found published, `None` before any: every guest write made
+    /// after its harvest began is stamped later (a source's ordering), so a copy that ran after it
+    /// was found may sync to it.
+    fn latest_published(&self) -> Option<DirtyStamp> {
+        match self.published.load(Ordering::Acquire) {
+            0 => None,
+            past => Some(DirtyStamp(past - 1)),
+        }
+    }
+
     /// [`DirtyPages::wrote`] of the source's offsets `range` by the runtime's own CPU (a
     /// `replaceRegion` of a texture over the pages, writer 0), where non-empty.
     pub(crate) fn wrote(&self, range: Range<u64>) {
@@ -343,7 +353,7 @@ pub(crate) struct ShadowLog {
     _watch: Box<dyn Send + Sync>,
     /// The stamp as of which the image holds every texel of the truth, but for the pages the log
     /// reports changed since (the module docs); `None` where it holds nothing a copy may count on.
-    hold: Mutex<Option<DirtyStamp>>,
+    hold: Mutex<Hold>,
     /// The submitted command buffers whose writes meet the truth or the shadow from a batch that
     /// may run after work submitted later, until each completes: while any does, the hold stays
     /// let go of and no copy in counts on it ([`DirtyShadows::planned`]).
@@ -366,6 +376,49 @@ impl ShadowLog {
         );
         if start < end {
             self.source.hook.wrote_as(start..end, self.writer);
+        }
+    }
+}
+
+/// A shadow's hold ([`ShadowLog`]), and how many times it was set, by which a raise or a release
+/// of a command buffer's own setting is told from a later command buffer's.
+#[derive(Default)]
+struct Hold {
+    stamp: Option<DirtyStamp>,
+    generation: u64,
+}
+
+impl ShadowLog {
+    /// The hold as it stands.
+    fn hold(&self) -> Option<DirtyStamp> {
+        lock(&self.hold).stamp
+    }
+
+    /// Set the hold to `stamp`: its generation.
+    fn set_hold(&self, stamp: Option<DirtyStamp>) -> u64 {
+        let mut hold = lock(&self.hold);
+        hold.generation += 1;
+        hold.stamp = stamp;
+        hold.generation
+    }
+
+    /// Raise the hold of `generation` to `stamp`, where nothing set it since: the generation then.
+    fn raise_hold(&self, generation: u64, stamp: DirtyStamp) -> Option<u64> {
+        let mut hold = lock(&self.hold);
+        let raises = hold.generation == generation && hold.stamp.is_none_or(|held| held < stamp);
+        if raises {
+            hold.generation += 1;
+            hold.stamp = Some(stamp);
+        }
+        raises.then_some(hold.generation)
+    }
+
+    /// Let go of the hold of `generation`, where nothing set it since.
+    fn release_hold(&self, generation: u64) {
+        let mut hold = lock(&self.hold);
+        if hold.generation == generation {
+            hold.generation += 1;
+            hold.stamp = None;
         }
     }
 }
@@ -448,7 +501,7 @@ impl DirtyShadows {
             delta,
             truth: offsets.clone(),
             _watch: source.hook.watch(offsets),
-            hold: Mutex::new(None),
+            hold: Mutex::new(Hold::default()),
             unsettled: AtomicU64::new(0),
         });
         logs.push(Arc::clone(&log));
@@ -472,13 +525,12 @@ impl DirtyShadows {
             return;
         }
         for gate in &commit.gates {
-            let Some(decision) = *lock(&gate.decision) else {
-                continue;
-            };
-            let mut hold = lock(&gate.log.hold);
-            if *hold == Some(decision.stamp) {
-                *hold = None;
+            if let Some(generation) = *lock(&gate.held_at) {
+                gate.log.release_hold(generation);
             }
+        }
+        for (log, generation) in &commit.held_at {
+            log.release_hold(*generation);
         }
     }
 
@@ -493,9 +545,9 @@ impl DirtyShadows {
     /// A committed command buffer's `commit` ([`DirtyCommit`]), at its commit: a stamp of each
     /// source its gated copies in read, one per source, asked now, so every CPU write made before
     /// the commit, which Metal shows the command buffer, is in the publication its copies in wait
-    /// for ([`planned`](Self::planned) decides what they copy); a stamp too for the logs of the
-    /// shadows its end left holding every texel of their truth (`held`) with no gated copy in
-    /// (a pass that cleared every texel), so their holds count from the commit on; and its copies
+    /// for ([`planned`](Self::planned) decides what they copy); the logs of the shadows its end
+    /// left holding every texel of their truth (`held`) with no gated copy in (a pass that
+    /// cleared every texel), whose holds its submission takes, asking no stamp; and its copies
     /// back and merges, reported ([`DirtyPages::wrote_as`]) before any stamp a later commit asks.
     pub(crate) fn stamped(&self, commit: &mut DirtyCommit, held: &[Arc<ShadowCopies>]) {
         for (log, range) in &commit.wrote {
@@ -518,8 +570,7 @@ impl DirtyShadows {
         for copies in held {
             let gated = (commit.gates.iter()).any(|gate| gate.of(copies));
             if let (false, Some(log)) = (gated, self.kept(copies)) {
-                let stamp = stamp_of(&log.source);
-                commit.held_logs.push((log, stamp));
+                commit.held_logs.push(log);
             }
         }
     }
@@ -537,7 +588,7 @@ impl DirtyShadows {
                 let bound = source.hook.publication_hold()?;
                 let counts = !gate.written_before
                     && gate.log.unsettled.load(Ordering::Acquire) == 0
-                    && lock(&gate.log.hold).is_some();
+                    && gate.log.hold().is_some();
                 (counts && !source.published_now(stamp)).then_some(bound)
             })
             .max()
@@ -558,7 +609,6 @@ impl DirtyShadows {
         held: &[Arc<ShadowCopies>],
         split: bool,
     ) {
-        let mut synced: Vec<(Arc<ShadowLog>, DirtyStamp)> = Vec::new();
         for gate in &commit.gates {
             let Some(stamp) = *lock(&gate.stamp) else {
                 continue;
@@ -566,10 +616,9 @@ impl DirtyShadows {
             let unsettled = gate.log.unsettled.load(Ordering::Acquire) > 0;
             let since = match gate.written_before || split || unsettled {
                 true => None,
-                false => *lock(&gate.log.hold),
+                false => gate.log.hold(),
             };
             *lock(&gate.decision) = Some(Decision { since, stamp });
-            synced.push((Arc::clone(&gate.log), stamp));
         }
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
         for log in &logs {
@@ -579,7 +628,7 @@ impl DirtyShadows {
             if !commit.wrote_over(&copies) {
                 continue;
             }
-            *lock(&log.hold) = None;
+            log.set_hold(None);
             if split {
                 log.unsettled.fetch_add(1, Ordering::AcqRel);
                 commit.unsettling.push(Arc::clone(log));
@@ -588,14 +637,34 @@ impl DirtyShadows {
         if split {
             return;
         }
-        synced.append(&mut commit.held_logs);
-        for (log, stamp) in synced {
-            let holds = log
-                .copies
-                .upgrade()
-                .is_some_and(|copies| held.iter().any(|h| Arc::ptr_eq(h, &copies)));
-            if holds && log.unsettled.load(Ordering::Acquire) == 0 {
-                *lock(&log.hold) = Some(stamp);
+        // A shadow its end held whole holds from the latest stamp its source is known to have
+        // published by now, which every copy of it ran after, and at most from its gate's own:
+        // a guest write made after a stamp's request but before its harvest began is stamped
+        // with it, so a copy may sync to a stamp only once it read the bytes after that stamp's
+        // publication. Its replay raises the hold to its gate's stamp once it finds that published
+        // ([`CopyInGate::regions`]). A source that answers at once is asked now.
+        for gate in &commit.gates {
+            let log = &gate.log;
+            let holds = held.iter().any(|copies| gate.of(copies));
+            let Some(stamp) = *lock(&gate.stamp) else {
+                continue;
+            };
+            if !holds || log.unsettled.load(Ordering::Acquire) > 0 {
+                continue;
+            }
+            if log.source.hook.publication_hold().is_some() {
+                log.source.published_now(stamp);
+            }
+            let from = log.source.latest_published().map(|known| known.min(stamp));
+            *lock(&gate.held_at) = Some(log.set_hold(from));
+        }
+        let DirtyCommit {
+            held_logs, held_at, ..
+        } = commit;
+        for log in held_logs.drain(..) {
+            if log.unsettled.load(Ordering::Acquire) == 0 {
+                let generation = log.set_hold(log.source.latest_published());
+                held_at.push((log, generation));
             }
         }
     }
@@ -610,9 +679,10 @@ pub(crate) struct DirtyCommit {
     gates: Vec<Arc<CopyInGate>>,
     wrote: Vec<(Arc<ShadowLog>, Range<u64>)>,
     unsettling: Vec<Arc<ShadowLog>>,
-    /// The logs of the shadows its end held whole with no gated copy in, and their stamps
-    /// ([`DirtyShadows::stamped`]).
-    held_logs: Vec<(Arc<ShadowLog>, DirtyStamp)>,
+    /// The logs of the shadows its end held whole with no gated copy in ([`DirtyShadows::stamped`]).
+    held_logs: Vec<Arc<ShadowLog>>,
+    /// Their holds as its submission set them, which its failure lets go of.
+    held_at: Vec<(Arc<ShadowLog>, u64)>,
 }
 
 /// The most writes a command buffer keeps apart, past which they are one write of everything.
@@ -651,6 +721,7 @@ impl DirtyCommit {
             written_before: self.wrote_over(copies),
             stamp: Mutex::new(None),
             decision: Mutex::new(None),
+            held_at: Mutex::new(None),
         });
         self.gates.push(Arc::clone(&gate));
         gate
@@ -690,6 +761,9 @@ pub(crate) struct CopyInGate {
     /// The stamp its commit asked of the log's source ([`DirtyShadows::stamped`]).
     stamp: Mutex<Option<DirtyStamp>>,
     decision: Mutex<Option<Decision>>,
+    /// The generation of the log's hold its submission set, or its replay raised, which its
+    /// failure lets go of ([`DirtyShadows::planned`]).
+    held_at: Mutex<Option<u64>>,
 }
 
 /// A run of rows more than this many rows from the next is copied apart.
@@ -748,8 +822,17 @@ impl CopyInGate {
         let total = bytes(whole);
         let decision = *lock(&self.decision);
         let changed = decision.and_then(|Decision { since, stamp }| {
+            // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
+            // submission set to its own stamp ([`DirtyShadows::planned`]).
+            let published = self.log.source.published(stamp, &self.tally);
+            if published {
+                let mut held_at = lock(&self.held_at);
+                if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
+                    *held_at = Some(raised);
+                }
+            }
             let since = since?;
-            if !self.log.source.published(stamp, &self.tally) {
+            if !published {
                 return None;
             }
             let mut runs = Vec::new();

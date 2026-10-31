@@ -38,6 +38,11 @@
 //! changed (nothing); a stamp the log never publishes within the hold goes at its end, every row
 //! (`WorkCounts::heads_held_for_dirty_publications`).
 //!
+//! A log kept as a VMM's harvester keeps one ([`Harvests`]: a request answers the next harvest to
+//! begin, and a guest write made before that harvest began carries the requested stamp): a copy in
+//! made before its stamp's publication syncs to no later stamp than one already published, so a
+//! guest write made after it and before that harvest began reaches the next copy in.
+//!
 //! A texture that renders and one that samples over the same logged bytes, laid out alike, at rows
 //! no linear image of the device takes (320 bytes for 64 texels), share one home
 //! (`texture/homes.rs`, `WorkCounts::shadow_homes_taken`): what the pass draws, the kernel reads
@@ -581,13 +586,13 @@ fn one_wait_serves_every_gated_copy_in_of_a_commit() {
     let invert = state(&device, "invert_texels");
     let sources = [&first, &second];
 
-    // Frame 1: no hold, so no wait.
+    // Frame 1: no hold, so every row; the publication is asked once, for the hold it takes.
     let before = waits(&device);
     run_each(&device, &invert, &sources, &target);
     let [stamps, waited, _] = std::array::from_fn(|i| waits(&device)[i] - before[i]);
     eprintln!("DIRTY-PAGES: waits frame 1: {stamps} stamps, {waited} waits");
     assert_eq!(stamps, 1, "one stamp per log and commit");
-    assert_eq!(waited, 0, "no hold, no wait");
+    assert_eq!(waited, 1, "one wait, for both copies' hold");
 
     // Frame 2: two gated copies over one log, one stamp and one wait.
     let before = waits(&device);
@@ -830,6 +835,142 @@ fn textures_over_the_same_logged_bytes_share_one_home() {
         "and the pass's green still"
     );
     drop(reader);
+    drop(buffer);
+    drop(device);
+}
+
+/// A log kept as a VMM's harvester keeps one: harvests numbered in order, each published as it is
+/// made; a request answers the next harvest to begin; a write is stamped with the harvest that will
+/// see it, so one made after a request and before that harvest began carries the requested stamp.
+#[derive(Default)]
+struct Harvests {
+    started: AtomicU64,
+    writes: Mutex<Vec<(u64, Range<u64>)>>,
+}
+
+impl Harvests {
+    fn harvest(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn told(&self, range: Range<u64>) {
+        let stamp = self.started.load(Ordering::SeqCst) + 1;
+        self.writes.lock().unwrap().push((stamp, range));
+    }
+}
+
+impl DirtyPages for Harvests {
+    type Watch = ();
+
+    fn watch(&self, _range: Range<u64>) {}
+
+    fn request(&self) -> DirtyStamp {
+        DirtyStamp(self.started.load(Ordering::SeqCst) + 1)
+    }
+
+    fn wait(&self, stamp: DirtyStamp) -> bool {
+        self.started.load(Ordering::SeqCst) >= stamp.0
+    }
+
+    fn published(&self, stamp: DirtyStamp) -> bool {
+        self.started.load(Ordering::SeqCst) >= stamp.0
+    }
+
+    fn publication_hold(&self) -> Option<Duration> {
+        Some(Duration::from_millis(20))
+    }
+
+    fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>) {
+        let writes = self.writes.lock().unwrap();
+        out.extend(
+            (writes.iter())
+                .filter(|w| w.0 > since.0)
+                .map(|w| w.1.clone()),
+        );
+    }
+
+    fn wrote(&self, range: Range<u64>) {
+        self.told(range);
+    }
+}
+
+#[test]
+fn a_write_made_before_its_stamps_harvest_reaches_the_next_copy_in() {
+    let scratch = Scratch::new("dirty-pages-harvests");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Harvests::default());
+    // SAFETY: the memory outlives the buffer (dropped after the device), and only the buffer's
+    // commands and the test use it while it lives.
+    let memory: HostMemory = unsafe { host.memory() }.with_dirty_pages(Arc::clone(&log));
+    let made = unsafe {
+        device.new_buffer_with_bytes_no_copy(memory, BYTES as u64, ResourceOptions::default(), None)
+    };
+    let buffer = match made {
+        Ok(buffer) => buffer,
+        Err(Error::Unsupported(gap)) => {
+            eprintln!("DIRTY-PAGES: the device imports no host memory: {gap:?}");
+            return;
+        }
+        Err(error) => panic!("new_buffer_with_bytes_no_copy: {error:?}"),
+    };
+    host.fill(0x1010_1010);
+    let shadows = device.work_counts().shadowed_textures;
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    let source = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    if device.work_counts().shadowed_textures == shadows {
+        eprintln!("DIRTY-PAGES: no shadow made");
+        return;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let queue = device.new_command_queue().unwrap();
+    // One command buffer inverting the source into the target, its stamp's harvest made after its
+    // commit where `harvest`, to completion.
+    let frame = |harvest: bool| {
+        let command_buffer = queue.command_buffer().unwrap();
+        let mut encoder = command_buffer.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&invert).unwrap();
+        encoder.set_texture(Some(&source), 0).unwrap();
+        encoder.set_texture(Some(&target), 1).unwrap();
+        encoder
+            .dispatch_threads(Size::new(SIDE, SIDE, 1), Size::new(8, 8, 1))
+            .unwrap();
+        encoder.end_encoding().unwrap();
+        command_buffer.commit().unwrap();
+        if harvest {
+            log.harvest();
+        }
+        assert!(command_buffer.wait_until_completed_for(WAIT).is_ok());
+        assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+    };
+    let inverted = |value: u8| [255 - value, 255 - value, 255 - value, value];
+
+    // Frame 1: published while held; frame 2: never published within the hold, every row.
+    frame(true);
+    frame(false);
+    // A guest write after frame 2's copy and before its stamp's harvest began: that stamp.
+    let bytes = buffer.contents().unwrap().as_ptr();
+    // SAFETY: a row of the buffer's first bytes, which no command uses now.
+    unsafe { std::ptr::write_bytes(bytes.add((33 * ROW) as usize), 0x33, ROW as usize) };
+    log.told(33 * ROW..34 * ROW);
+    log.harvest();
+    // Frame 3 takes the row: frame 2's copy, made before that harvest, synced to no later stamp.
+    let before = counts(&device);
+    frame(true);
+    let third = delta(&device, before);
+    eprintln!("DIRTY-PAGES: harvests frame 3 {third:?}");
+    assert_eq!(
+        texel(&target, 33),
+        inverted(0x33),
+        "the guest's row reaches the copy"
+    );
+    drop(source);
     drop(buffer);
     drop(device);
 }
