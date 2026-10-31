@@ -65,6 +65,8 @@ impl HomeKey {
 /// One home: its image, texels and copies, held weakly.
 struct Home {
     key: HomeKey,
+    /// The host addresses of its bytes, where known (the census's miss lines).
+    host: Option<std::ops::Range<u64>>,
     image: Weak<Image>,
     texels: Weak<Texels>,
     copies: Weak<ShadowCopies>,
@@ -82,11 +84,11 @@ const HOMES: usize = 256;
 impl ShadowHomes {
     /// The storage of a live home of `key` whose image serves a texture planned as `plan`, marked
     /// shared; `None` where none does.
-    pub(super) fn take(&self, key: HomeKey, plan: &ImagePlan) -> Option<Storage> {
+    pub(super) fn take(&self, key: HomeKey, plan: &ImagePlan, texels: &Texels) -> Option<Storage> {
         let mut homes = lock(&self.homes);
         homes.retain(|home| home.copies.strong_count() > 0);
         if crate::dirty_pages::census_on() {
-            miss_lines(&homes, key, plan);
+            miss_lines(&homes, key, plan, texels);
         }
         (homes.iter())
             .filter(|home| home.key == key)
@@ -121,6 +123,7 @@ impl ShadowHomes {
         if homes.len() < HOMES {
             homes.push(Home {
                 key,
+                host: texels.host_bytes(),
                 image: Arc::downgrade(image),
                 texels: Arc::downgrade(texels),
                 copies: Arc::downgrade(copies),
@@ -129,14 +132,19 @@ impl ShadowHomes {
     }
 }
 
-/// How many home misses the census printed (`METAL2VULKAN_LOG_DIRTY_CENSUS`), past which it
-/// prints none.
-static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The misses the census printed (`METAL2VULKAN_LOG_DIRTY_CENSUS`), by shape and kind: each
+/// once, 200 at most.
+static MISSES: Mutex<Vec<([u32; 3], u64, bool)>> = Mutex::new(Vec::new());
 
-/// Under the census, why no live home serves a texture of `key` planned as `plan` where one of its
-/// shape lies over another buffer, or over its bytes but serves it not: a diagnostic, printed
-/// for the first 40.
-fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan) {
+/// Under the census, why no live home serves a texture of `key` planned as `plan` over
+/// `texels` where one of its shape lies over the same host bytes through another buffer, or over
+/// its bytes but serves it not: a diagnostic, each shape and kind printed once.
+fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan, texels: &Texels) {
+    let host = texels.host_bytes();
+    let overlaps = |theirs: &Option<std::ops::Range<u64>>| match (theirs, &host) {
+        (Some(a), Some(b)) => a.start < b.end && b.start < a.end,
+        _ => false,
+    };
     let near = |home: &&Home| {
         home.key.extent == key.extent
             && home.key.row_pitch == key.row_pitch
@@ -148,9 +156,10 @@ fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan) {
         };
         let theirs = image.plan();
         let why = match home.key == key {
+            false if !overlaps(&home.host) => continue,
             false => format!(
-                "a home of its shape over other bytes (buffer {:?} offset {} tracked {}, its \
-                 {:?} offset {} tracked {})",
+                "a home of its shape over the same host bytes through another buffer (buffer {:?} \
+                 offset {} tracked {}, its {:?} offset {} tracked {})",
                 home.key.buffer,
                 home.key.offset,
                 home.key.tracked,
@@ -171,12 +180,18 @@ fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan) {
                 plan.flags
             ),
         };
-        if MISSES.fetch_add(1, Ordering::Relaxed) < 40 {
-            eprintln!(
-                "m2v home miss {}x{} rows {}: {why}",
-                key.extent[0], key.extent[1], key.row_pitch
-            );
+        let seen = (key.extent, key.row_pitch, home.key == key);
+        {
+            let mut misses = lock(&MISSES);
+            if misses.contains(&seen) || misses.len() >= 200 {
+                continue;
+            }
+            misses.push(seen);
         }
+        eprintln!(
+            "m2v home miss {}x{} rows {}: {why}",
+            key.extent[0], key.extent[1], key.row_pitch
+        );
     }
 }
 

@@ -2376,7 +2376,7 @@ impl Device {
             && surface_depth_unit(layout.pixel_format).is_none())
         .then(|| homes::HomeKey::of(&texels, &plan, texels.tracked()));
         if let Some(key) = home {
-            if let Some(storage) = self.shared().textures.homes.take(key, &plan) {
+            if let Some(storage) = self.shared().textures.homes.take(key, &plan, &texels) {
                 self.shared().counts.shadow_home_taken();
                 if device_copy {
                     self.shared().counts.device_copy_texture();

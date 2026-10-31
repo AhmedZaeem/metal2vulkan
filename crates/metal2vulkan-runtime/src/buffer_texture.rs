@@ -1391,6 +1391,14 @@ impl Texels {
         (bytes.key, layout.offset, layout.row_pitch, self.texel_bytes)
     }
 
+    /// The host addresses of these texels' bytes, where the buffer has them (a diagnostic of
+    /// `texture/homes.rs`'s).
+    pub(super) fn host_bytes(&self) -> Option<std::ops::Range<u64>> {
+        let layout = &self.layout;
+        let start = (self.buffer.contents()?.as_ptr() as u64).checked_add(layout.offset)?;
+        Some(start..start.checked_add(layout.end() - layout.offset)?)
+    }
+
     /// Each condition of [`device_copy`](Self::device_copy), in words (a diagnostic).
     pub(super) fn device_copy_why(&self, device: &Device) -> String {
         let layout = &self.layout;
