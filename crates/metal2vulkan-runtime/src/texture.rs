@@ -397,7 +397,7 @@ impl ImagePlacement {
 #[derive(Clone)]
 pub struct Texture(Arc<TextureShared>);
 
-/// A texture held without keeping it ([`Texture::downgrade`]): it lives while the texture
+/// A texture held without keeping it ([`Texture::weak`]): it lives while the texture
 /// object does, until its last handle and the command buffers that hold it are gone.
 #[derive(Clone)]
 pub struct WeakTexture(Weak<TextureShared>);
@@ -4167,7 +4167,7 @@ pub(super) enum IdUse {
 
 impl Texture {
     /// A handle that does not keep the texture ([`WeakTexture`]).
-    pub fn downgrade(&self) -> WeakTexture {
+    pub fn weak(&self) -> WeakTexture {
         WeakTexture(Arc::downgrade(&self.0))
     }
 
