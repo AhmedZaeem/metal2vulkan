@@ -2508,6 +2508,18 @@ impl Device {
         Ok(storage)
     }
 
+    /// Sweep the homes now: an import of host pages went, or a rebind moved a buffer's bytes, so
+    /// the homes over them go at once (`texture/homes.rs`).
+    pub(crate) fn home_pages_gone(&self) {
+        self.shared().textures.homes.pages_gone();
+    }
+
+    /// The homes' tally (`texture/homes.rs`): made, taken, and afterlives kept, taken, expired,
+    /// evicted and dropped, and the bytes kept.
+    pub(crate) fn home_tally(&self) -> [u64; 7] {
+        self.shared().textures.homes.tally()
+    }
+
     /// Another texture's live home over the same host bytes as `copies`, whose first texel lies
     /// at the host address `host` (`texture/homes.rs`).
     pub(crate) fn sibling_home(

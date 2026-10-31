@@ -4419,6 +4419,22 @@ pub struct WorkCounts {
     /// (`texture/homes.rs`): one device-local image, its copies and its log's hold, for every such
     /// texture, so what one renders the others sample in the device's memory.
     pub shadow_homes_taken: u64,
+    /// Homes made: textures over logged host pages whose own shadow became the home of their
+    /// bytes and layout (`texture/homes.rs`).
+    pub shadow_homes_made: u64,
+    /// Homes whose last texture went, kept a while for another over their bytes (the afterlife,
+    /// `texture/homes.rs`).
+    pub home_afterlives_kept: u64,
+    /// Of those, the ones a texture made over their bytes again took.
+    pub home_afterlives_taken: u64,
+    /// Of those, the ones no texture took within 250 ms.
+    pub home_afterlives_expired: u64,
+    /// Of those, the ones evicted past 256 MiB of such homes' images, the longest kept first.
+    pub home_afterlives_evicted: u64,
+    /// Homes dropped at once as their pages went: their buffer gone, or rebound.
+    pub home_afterlives_dropped: u64,
+    /// The bytes of the images homes in their afterlife keep now.
+    pub home_afterlife_bytes: u64,
     /// Of `host_textures_in_place`, those over pages imported as dma-bufs: each a
     /// `DRM_FORMAT_MOD_LINEAR` image over a dma-buf of its own pages (also counted in
     /// `dma_buf_images`).
@@ -4931,6 +4947,7 @@ impl Device {
         // (`render/deferral.rs`).
         self.shared().deferred.lower_all();
         let counters = &self.shared().counts;
+        let homes = self.home_tally();
         // The driver's time in its pipeline makings (`device/compiles.rs`, by `VkDevice`), and
         // what the shader cache's directory cost (`shader_cache/store.rs`): neither is in
         // `Counters`.
@@ -5464,6 +5481,13 @@ impl Device {
             host_textures_in_place: counters.host_textures_in_place.load(Ordering::Relaxed),
             device_copy_textures: counters.device_copy_textures.load(Ordering::Relaxed),
             shadow_homes_taken: counters.shadow_homes_taken.load(Ordering::Relaxed),
+            shadow_homes_made: homes[0],
+            home_afterlives_kept: homes[1],
+            home_afterlives_taken: homes[2],
+            home_afterlives_expired: homes[3],
+            home_afterlives_evicted: homes[4],
+            home_afterlives_dropped: homes[5],
+            home_afterlife_bytes: homes[6],
             dma_buf_textures_in_place: counters.dma_buf_textures_in_place.load(Ordering::Relaxed),
             fresh_page_textures_in_place: counters
                 .fresh_page_textures_in_place

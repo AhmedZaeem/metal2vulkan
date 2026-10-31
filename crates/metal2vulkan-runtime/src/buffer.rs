@@ -1294,6 +1294,8 @@ impl Device {
 
 impl Drop for HostImport {
     fn drop(&mut self) {
+        // The homes over its pages go with it (`texture/homes.rs`).
+        self.device.home_pages_gone();
         // A copy leaves its device's comparisons before its memory can go (`copied.rs`).
         drop(self.copied.take());
         // The Vulkan teardown is a section of the exit guard.

@@ -937,6 +937,8 @@ impl Device {
             buffer.reencode();
         }
         drop(again);
+        // The homes over the old pages go at once, whether or not they went (`texture/homes.rs`).
+        self.home_pages_gone();
         Ok(())
     }
 
