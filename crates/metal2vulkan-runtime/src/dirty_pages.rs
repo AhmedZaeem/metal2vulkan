@@ -160,6 +160,13 @@ pub trait DirtyPages: Send + Sync {
         None
     }
 
+    /// When the runtime writes what the GPU wrote through a shadow over the memory back into it
+    /// ([`WriteBack`]). [`WriteBack::Eager`] (the default): as each encoder that wrote ends, as a
+    /// Metal shared resource holds the GPU's writes once its command buffer completes.
+    fn write_back(&self) -> WriteBack {
+        WriteBack::Eager
+    }
+
     /// Append to `out` the byte runs, as offsets from the memory's pointer, of the watched pages
     /// stamped later than `since`, and of those whose continuous watch began after it.
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>);
@@ -183,6 +190,23 @@ pub trait DirtyPages: Send + Sync {
         let _ = writer;
         self.changed(since, out);
     }
+}
+
+/// When the runtime writes what the GPU wrote through a shadow back into the memory under it
+/// ([`DirtyPages::write_back`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WriteBack {
+    /// As each encoder that wrote through the shadow ends: the memory holds the GPU's writes once
+    /// the command buffer completes, as a Metal shared resource's does.
+    #[default]
+    Eager,
+    /// When asked ([`Device::write_back_deferred`](crate::Device::write_back_deferred)), before
+    /// a use of the memory's bytes other than through the shadow, and before the shadow goes; the
+    /// runtime may write back earlier. The source's owner promises that no CPU reads the bytes
+    /// the GPU wrote before it asks (an IOSurface whose users lock it before they read), so the
+    /// memory may hold older bytes than the shadow until then. Until the runtime keeps such
+    /// writes, it writes back as [`Eager`](Self::Eager) does.
+    OnRequest,
 }
 
 /// A [`DirtyPages`] source of any watch type, as the runtime keeps it: its watches boxed.

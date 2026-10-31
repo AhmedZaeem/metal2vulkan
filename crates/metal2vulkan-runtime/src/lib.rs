@@ -256,7 +256,7 @@ pub use device::{
     LayerSettingValue, MessageKind, MessageSeverity, MessageSink, PhysicalDeviceIdentity,
     RawDevice,
 };
-pub use dirty_pages::{DirtyPages, DirtyStamp};
+pub use dirty_pages::{DirtyPages, DirtyStamp, WriteBack};
 #[cfg(unix)]
 pub use dma_buf::{DmaBufChunk, DmaBufRequest, DmaBufSource};
 pub use dynamic_library::DynamicLibrary;

@@ -969,6 +969,16 @@ impl Device {
         properties::registry_id(&self.0.properties.device_uuid)
     }
 
+    /// Writes into their memories what the shadows over memories whose sources answer
+    /// [`WriteBack::OnRequest`](crate::WriteBack::OnRequest) kept of the GPU's writes, over the
+    /// host addresses `host` (`None`: every one; an implementation may write back more), once the
+    /// commands that wrote them complete, and returns when it is there. Nothing is kept yet (no
+    /// shadow defers its write-back), so it returns at once.
+    pub fn write_back_deferred(&self, host: Option<std::ops::Range<u64>>) -> Result<(), Error> {
+        let _ = host;
+        Ok(())
+    }
+
     /// `name`.
     pub fn name(&self) -> &str {
         &self.0.properties.name
