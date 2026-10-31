@@ -160,6 +160,8 @@ mod linear_attachment;
 mod linear_plan;
 mod making;
 mod managed;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod mask_cache_corner;
 mod memo;
 mod memory;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
