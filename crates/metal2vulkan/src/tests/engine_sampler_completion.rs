@@ -350,8 +350,9 @@ fn a_dynamic_sample_offset_is_an_offset_operand_of_its_low_four_bits() {
         operand_masks(&a, OP_IMAGE_SAMPLE_EXPLICIT_LOD, 5),
         [MASK_LOD | MASK_OFFSET]
     );
-    assert_eq!(glsl(&a, GLSL_SCLAMP), 0);
-    assert_eq!(count(&a, OP_BIT_FIELD_S_EXTRACT), 1);
+    // The exact fetch's clamp and its offset's extract (`Sampling::exact`, a local deviation).
+    assert_eq!(glsl(&a, GLSL_SCLAMP), 1);
+    assert_eq!(count(&a, OP_BIT_FIELD_S_EXTRACT), 2);
     for f in [
         VkFeature::Maintenance8,
         VkFeature::ShaderImageGatherExtended,

@@ -948,7 +948,7 @@ pub(super) fn sampled_value(
     };
     let arm = if exact.is_some() { None } else { arm };
     if let SampleOp::PixelFetch { offset } = &s.op {
-        let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm)?;
+        let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm, false)?;
         let x = unmapped_value(cx, fb, s, x, word)?;
         let x = live_or_zero(fb, live, x)?;
         return texel_value(cx, fb, s, image, (x, TexelOrigin::Image), word);
@@ -962,18 +962,39 @@ pub(super) fn sampled_value(
     }
     // An argument buffer's sampler whose flags select the exact fetch: the fetch, made here from
     // the sampled image the sample reads too, and chosen after the sample by the handle's flags.
-    // Both run, so no branch puts the sample in divergent flow.
-    let flagged_fetch = match (&s.pixel, &s.op) {
+    // Both run, so no branch puts the sample in divergent flow. A runtime slot's exact fetch
+    // (`Sampling::exact`) likewise, chosen by its word.
+    let block = fb.current_block();
+    let flagged_fetch = match (&s.pixel, &s.op, s.exact) {
         (
             Pixel::Heap(handle),
             SampleOp::Sample {
                 dref: None, offset, ..
             },
+            _,
         ) => {
-            let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm)?;
-            Some((*handle, x, word))
+            let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm, false)?;
+            Some((Flagged::Heap(*handle), x, word))
+        }
+        (
+            Pixel::Spec(n),
+            SampleOp::Sample {
+                dref: None, offset, ..
+            },
+            Some(mask),
+        ) => {
+            let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm, true)?;
+            Some((Flagged::Slot(*n, mask), x, word))
         }
         _ => None,
+    };
+    // A sampled image is consumed in the block that makes it, and a fetch under a sparse arm or
+    // a tile map ends in another: there the sample makes its own.
+    let si = match flagged_fetch {
+        Some((Flagged::Slot(..), _, _)) if fb.current_block() != block => {
+            sampled_image(cx, fb, s.source)?.0
+        }
+        _ => si,
     };
     let (mut coord, mut grad) = plane_and_gradients(cx, fb, s, grads)?;
     // Pixel coordinates: the plane coordinate (and any gradient) over the level-0 size, always
@@ -1064,11 +1085,21 @@ pub(super) fn sampled_value(
                 // The fetch where the sampler's word states what the image needs: pixel
                 // coordinates, one isotropic level clamped to the edge on each plane axis, and
                 // nearest filters unless the texture is integer.
-                Some((handle, fetched, fetched_word)) => {
-                    let integer = image.texel != TexelClass::Float;
-                    let mask = SamplerWord::exact_fetch(image.plane, integer);
-                    let state = heap_sampler_field(cx, fb, handle, EntryField::Flags)?;
-                    let take = word_states(fb, state, mask)?;
+                Some((flagged, fetched, fetched_word)) => {
+                    let take = match flagged {
+                        Flagged::Heap(handle) => {
+                            let integer = image.texel != TexelClass::Float;
+                            let mask = SamplerWord::exact_fetch(image.plane, integer);
+                            let state = heap_sampler_field(cx, fb, handle, EntryField::Flags)?;
+                            word_states(fb, state, mask)?
+                        }
+                        // A normalized nearest sampler clamped to the edge: the mask's fields
+                        // are all 0, pixel coordinates among them.
+                        Flagged::Slot(n, mask) => {
+                            let word = sampler_word(cx, fb, Pixel::Spec(n))?;
+                            word_clear(fb, word, mask)?
+                        }
+                    };
                     let x = fb.select(take, fetched, x)?;
                     let word = match (fetched_word, word) {
                         (Some(f), Some(w)) => Some(fb.select(take, f, w)?),
@@ -1232,6 +1263,24 @@ fn heap_sampler_field(
     };
     let k = cx.operand(fb, handle)?;
     entry_field(fb, table.table, k, field)
+}
+
+/// Whose word selects a sample's exact fetch: an argument buffer's sampler of a heap handle, or a
+/// runtime slot's under its exact-fetch mask (`Sampling::exact`).
+#[derive(Clone, Copy)]
+enum Flagged {
+    Heap(ValueId),
+    Slot(u32, u32),
+}
+
+/// Whether sampler word `word` masked by `mask` is 0 (a `bool`).
+fn word_clear(fb: &mut FunctionBuilder<'_>, word: SValue, mask: u32) -> BResult<SValue> {
+    let m = fb.u32_const(mask)?;
+    let m = fb.module().const_value(m)?;
+    let have = fb.binary(BinOp::BitwiseAnd, word, m)?;
+    let zero = fb.u32_const(0)?;
+    let zero = fb.module().const_value(zero)?;
+    fb.binary(BinOp::IEqual, have, zero)
 }
 
 /// Whether sampler word `word` masked by `mask` is exactly [`SamplerWord::PIXEL_COORDINATES`] (a
@@ -1723,8 +1772,8 @@ pub(super) fn word_pixel(s: &Sampling) -> Option<Pixel> {
 
 /// The texel a nearest, clamp-to-edge pixel sampler returns, exactly: `OpImageFetch` of the base
 /// level at `clamp(floor(coord) + offset, 0, size - 1)`, the layer clamped into the array as
-/// sampling clamps it. A depth texel is its first component. Under a sparse arm the fetch's status
-/// word too.
+/// sampling clamps it; for a `normalized` coordinate at `floor(coord * size)`, the product in
+/// `f32`. A depth texel is its first component. Under a sparse arm the fetch's status word too.
 fn pixel_fetch(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -1733,6 +1782,7 @@ fn pixel_fetch(
     image: super::CombinedImage,
     offset: Option<&Offset>,
     arm: Option<(SValue, Binding)>,
+    normalized: bool,
 ) -> BResult<(SValue, Option<SValue>)> {
     let img = fb.image(si)?;
     let zero = fb.u32_const(0)?;
@@ -1776,6 +1826,15 @@ fn pixel_fetch(
         fb.module().const_value(c)
     };
     let coord = plane_coord(cx, fb, s)?;
+    let coord = match normalized {
+        true => {
+            let f = f32_ty(fb)?;
+            let fvec = vec(fb, f, lanes)?;
+            let fsize = fb.convert(ConvOp::ConvertUToF, plane, fvec)?;
+            fb.binary(BinOp::FMul, coord, fsize)?
+        }
+        false => coord,
+    };
     let floor = fb.glsl(GlslOp::Floor, &[coord])?;
     let mut texel = fb.convert(ConvOp::ConvertFToS, floor, ivec)?;
     match offset {

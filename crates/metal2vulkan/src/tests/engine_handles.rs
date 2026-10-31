@@ -2224,9 +2224,10 @@ fn a_heap_texture_samples_through_a_runtime_sampler() {
             "{stem}"
         );
         // The device's sampled image, and the raw-held emulation's four filtered taps and its
-        // nearest one, fetched from the unsigned twin.
+        // nearest one, fetched from the unsigned twin, and the exact fetch (`Sampling::exact`, a
+        // local deviation).
         assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{stem}");
-        assert_eq!(count(&a, OP_IMAGE_FETCH), 5, "{stem}");
+        assert_eq!(count(&a, OP_IMAGE_FETCH), 6, "{stem}");
         compiled += 1;
     }
     assert!(compiled > 0, "no committed profile has the heaps");
@@ -2822,9 +2823,11 @@ fn heap_linear_samples_are_the_device_s() {
             let argument = matches!(through, CompareThrough::Argument);
             // The raw-held emulation: four filtered taps and a nearest one from the twin.
             let raw = !three && !argument;
+            // And a runtime sampler's exact fetch (`Sampling::exact`, a local deviation).
+            let runtime = matches!(through, CompareThrough::Runtime);
             assert_eq!(
                 count(&a, OP_IMAGE_FETCH),
-                usize::from(argument) + 5 * usize::from(raw),
+                usize::from(argument || runtime) + 5 * usize::from(raw),
                 "{what}"
             );
             assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{what}");
@@ -3012,8 +3015,9 @@ fn heap_gathers_and_nearest_samples_are_the_device_s() {
                 OP_IMAGE_SAMPLE_EXPLICIT_LOD
             };
             assert_eq!(count(&a, device), 1, "{what}");
-            // The fetch of an argument buffer's sampler's sample.
-            let exact = usize::from(argument && !gather);
+            // The fetch of an argument buffer's or a runtime sampler's sample (a runtime one's
+            // `Sampling::exact`, a local deviation).
+            let exact = usize::from(word && !gather);
             // Through a constexpr or runtime sampler, the raw-held emulation's fetches from the
             // twin: a gather's four, a nearest sample's one, a runtime sampler's four filtered and
             // one nearest.

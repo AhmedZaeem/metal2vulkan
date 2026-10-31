@@ -1948,6 +1948,15 @@ fn select_one(
         SamplerArg::Static(SamplerRef::Constexpr(_), Coordinates::Pixel) if !cube => Pixel::Always,
         _ => Pixel::None,
     };
+    // A runtime slot's sample without comparison fetches its texel where the bound sampler is a
+    // normalized nearest one clamped to the edge, which reads one level (`Sampling::exact`).
+    let exact = match (pixel, &op, shape.dim) {
+        (Pixel::Spec(_), SampleOp::Sample { dref: None, .. }, ImageDim::D1) => Some(1),
+        (Pixel::Spec(_), SampleOp::Sample { dref: None, .. }, ImageDim::D2) => Some(2),
+        (Pixel::Spec(_), SampleOp::Sample { dref: None, .. }, ImageDim::D3) => Some(3),
+        _ => None,
+    }
+    .map(|axes| SamplerWord::exact_fetch(axes, integer));
     // A `half` texel's NaN is the device's decode, a bicubic sample's taps included: where the
     // bound format may hold one.
     let half = form.is_some_and(|f| f.conv == TexelConv::F16);
@@ -1985,6 +1994,7 @@ fn select_one(
         };
         s.compare |= compare;
         s.coordinates |= pixel != Pixel::None;
+        s.exact |= exact.unwrap_or(0);
         // A cube's gradients whose footprint the word chooses read its anisotropy.
         s.anisotropy |= matches!(
             op,
@@ -2343,6 +2353,7 @@ fn select_one(
         raw,
         srgb_codes,
         clamp_reference,
+        exact,
     };
     Ok(sampling)
 }

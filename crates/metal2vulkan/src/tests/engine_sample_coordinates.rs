@@ -533,12 +533,20 @@ fn a_runtime_samplers_gather_and_sample_read_only_its_coordinates() {
             let a = compile(&bc, "k", p).unwrap_or_else(|e| panic!("{what}: {e}"));
             link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: {e}"));
             assert!(requires_the_sampler(&a, p), "{what}");
-            assert_eq!(sampler_fields(&a), SamplerWord::PIXEL_COORDINATES, "{what}");
+            // A sample also reads the exact fetch's fields (`Sampling::exact`, a local
+            // deviation).
+            let fields = match op {
+                Op::Sample2D => SamplerWord::exact_fetch(2, false),
+                _ => SamplerWord::PIXEL_COORDINATES,
+            };
+            assert_eq!(sampler_fields(&a), fields, "{what}");
             assert!(
                 a.precision.contains(&PrecisionNote::PixelSamplerScaling),
                 "{what}"
             );
-            assert_eq!(glsl_count(&a, GLSL_FLOOR), 0, "{what}");
+            // The exact fetch's floor (`Sampling::exact`, a local deviation).
+            let floors = usize::from(matches!(op, Op::Sample2D));
+            assert_eq!(glsl_count(&a, GLSL_FLOOR), floors, "{what}");
         }
     }
 }

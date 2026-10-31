@@ -95,6 +95,10 @@
 //! a sample through one without comparison emits both the scaled sample and that fetch, and
 //! selects the fetch where its table entry's word states the state
 //! (`metal::sampler::SamplerWord::exact_fetch`); gathers and comparisons stay scaled.
+//! A runtime sampler slot's sample without comparison likewise also fetches at
+//! `clamp(floor(coord * size))` and selects the fetch where the slot's word states a normalized
+//! sampler that would fetch so ([`Sampling::exact`]): a local deviation from the device's own
+//! sampling (docs/FAST-PATHS.md), whose nearest texel at an edge is the device's otherwise.
 //!
 //! **Texel offsets**. Metal reads each component of an offset as the two's-complement value of its
 //! low four bits ([`metal_offset`]), which is the identity on its documented range
@@ -613,6 +617,15 @@ pub struct Sampling {
     /// reference is clamped to `[0, 1]`, a NaN taken as 0, before every comparison
     /// ([`emit::reference`]).
     pub clamp_reference: bool,
+    /// A sample without comparison through a runtime sampler slot: the mask
+    /// ([`SamplerWord::exact_fetch`]) under which the slot's word is 0 for a normalized sampler
+    /// that reads one isotropic level, clamps each plane axis to the edge and filters nearest
+    /// (unless the texture is integer). Under it the sample reads its texel by a fetch at
+    /// `clamp(floor(coord * size))` instead of the device's sampler. A local deviation from the
+    /// device's own sampling (docs/FAST-PATHS.md, the device sampler row): the device's
+    /// normalized nearest sample reads the neighbouring texel at and just past a texel edge
+    /// (measured on the NVIDIA RTX A5000 Laptop GPU), where Java2D's mask fill samples.
+    pub exact: Option<u32>,
 }
 
 /// The declared result of a sampling whose slot's variant binds a texture of another numeric
@@ -905,9 +918,12 @@ impl Sampling {
         };
         // An argument buffer's sampler also fetches the texel the rule names: the size query, the
         // floor, the clamp, the fetch (with its own dynamic offset), and the flags' test and
-        // selection.
+        // selection; a runtime slot's exact fetch also its scale.
         let fetch = match (&self.pixel, &self.op) {
             (Pixel::Heap(_), SampleOp::Sample { dref: None, .. }) => 96 + 32 + wrap,
+            (Pixel::Spec(_), SampleOp::Sample { dref: None, .. }) if self.exact.is_some() => {
+                96 + 32 + 16 + wrap
+            }
             _ => 0,
         };
         // An argument buffer's sampler reads its entry's word for each test of it: its pixel
@@ -986,6 +1002,9 @@ pub struct RuntimeSlot {
     /// An emulated anisotropic sample reads it ([`anisotropic`]): the function reads its word's
     /// anisotropy and mip filter and its `SpecKey::SamplerAnisotropy` specialization.
     pub emulated: bool,
+    /// The masks of the samples that fetch their texel where its word states a normalized
+    /// nearest sampler clamped to the edge ([`Sampling::exact`]): the function reads those fields.
+    pub exact: u32,
 }
 
 impl RuntimeSlot {
@@ -1011,7 +1030,7 @@ impl RuntimeSlot {
         if self.texels {
             fields |= SamplerWord::LINEAR_FILTER;
         }
-        fields
+        fields | self.exact
     }
 
     /// The slot's interface entry.
@@ -1514,6 +1533,7 @@ pub fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error
                 texels: false,
                 min_level: false,
                 emulated: false,
+                exact: 0,
             });
     }
     Ok(())

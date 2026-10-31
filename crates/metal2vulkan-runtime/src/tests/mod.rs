@@ -160,8 +160,6 @@ mod linear_attachment;
 mod linear_plan;
 mod making;
 mod managed;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod mask_cache_corner;
 mod memo;
 mod memory;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
@@ -180,6 +178,8 @@ mod multisample_buffer_copy;
 mod multisample_buffer_layouts;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod nan_signs;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod nearest_texel_edges;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod neutral_zeros_shared;
 mod noted_apart;

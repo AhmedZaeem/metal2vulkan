@@ -289,8 +289,13 @@ fn runtime_samplers_select_pixel_coordinates_by_specialization() {
         .facts
         .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
     assert!(a.facts.contains(&RuntimeFact::SamplerReduction { slot: s }));
-    // The coordinates bit alone: the device's sampler reads the scaled coordinate.
-    assert_eq!(sampler_fields(&a, s), Some(SamplerWord::PIXEL_COORDINATES));
+    // The coordinates bit, and the fields of the exact fetch a normalized nearest sampler
+    // clamped to the edge takes (`Sampling::exact`, a local deviation): otherwise the device's
+    // sampler reads the scaled coordinate.
+    assert_eq!(
+        sampler_fields(&a, s),
+        Some(SamplerWord::exact_fetch(2, false))
+    );
     assert!(a.precision.contains(&PrecisionNote::PixelSamplerScaling));
     assert_eq!(uses(&a, "sampler.sample"), 1);
     assert_eq!(combined(&a), vec![(0, SamplerRef::Slot(0), false, false)]);
@@ -327,9 +332,10 @@ fn a_runtime_samplers_sample_is_the_device_s() {
     let (mut metal, mut device) = (0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
         let a = ok(&bc, "sample_level", &p);
+        // With the exact fetch's fields (`Sampling::exact`, a local deviation).
         assert_eq!(
             sampler_fields(&a, s),
-            Some(SamplerWord::PIXEL_COORDINATES),
+            Some(SamplerWord::exact_fetch(2, false)),
             "{stem}"
         );
         assert_eq!(uses(&a, "sampler.sample"), 1, "{stem}");
@@ -382,7 +388,13 @@ fn a_runtime_samples_level_is_the_device_s() {
         for (stem, p) in committed_profiles().expect("profiles") {
             let a = ok(&bc, "k", &p);
             let fields = sampler_fields(&a, s).unwrap_or(0);
-            assert_eq!(fields & levels, 0, "{name} {stem}");
+            // The exact fetch reads the mip filter, to tell a sampler that reads one level
+            // (`Sampling::exact`, a local deviation).
+            assert_eq!(
+                fields & levels & !SamplerWord::MIP_FILTER,
+                0,
+                "{name} {stem}"
+            );
         }
     }
 }
@@ -408,11 +420,13 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
         for (stem, p) in committed_profiles().expect("profiles") {
             let what = format!("{name} on {stem}");
             let a = ok(&bc, "k", &p);
-            assert_eq!(
-                sampler_fields(&a, s),
-                Some(SamplerWord::PIXEL_COORDINATES),
-                "{what}"
-            );
+            // A sample also reads the exact fetch's fields (`Sampling::exact`, a local
+            // deviation).
+            let fields = match name {
+                "pixel_sample" => SamplerWord::exact_fetch(2, false),
+                _ => SamplerWord::PIXEL_COORDINATES,
+            };
+            assert_eq!(sampler_fields(&a, s), Some(fields), "{what}");
             assert!(a
                 .facts
                 .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
@@ -420,10 +434,7 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
                 a.precision.contains(&PrecisionNote::PixelSamplerScaling),
                 "{what}"
             );
-            let key = SpecKey::SamplerState {
-                slot: s,
-                fields: SamplerWord::PIXEL_COORDINATES,
-            };
+            let key = SpecKey::SamplerState { slot: s, fields };
             let held: Vec<&SpecializedNote> = a
                 .specialized
                 .iter()
@@ -437,7 +448,9 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
                     .all(|t| t.key == key && t.mask == SamplerWord::PIXEL_COORDINATES)),
                 "{what}: {held:?}"
             );
-            assert_eq!(glsl_count(&a, GLSL_FLOOR), 0, "{what}");
+            // The exact fetch's floor (`Sampling::exact`, a local deviation).
+            let floors = usize::from(name == "pixel_sample");
+            assert_eq!(glsl_count(&a, GLSL_FLOOR), floors, "{what}");
             assert!(count(&a, OP_FDIV) >= 1, "{what}");
         }
     }
@@ -1116,7 +1129,8 @@ fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
         operand_masks(&a, OP_IMAGE_SAMPLE_IMPLICIT_LOD, 5),
         [MASK_OFFSET]
     );
-    assert_eq!(sign_extracts(&a), 1);
+    // The sample's, and the exact fetch's (`Sampling::exact`, a local deviation).
+    assert_eq!(sign_extracts(&a), 2);
     assert!(a.requirements.features.contains(&VkFeature::Maintenance8));
 }
 
