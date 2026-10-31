@@ -732,6 +732,14 @@ pub enum SpecKey {
     /// its descriptor (0 without a mip filter, else its `lodMinClamp` on Metal's grid). A slot
     /// bound to no sampler takes 0.
     SamplerMinLevel(SlotRef),
+    /// Boolean (`u32` 0 or 1, default 0): the runtime sampler bound to the slot reads its texel
+    /// by the exact fetch of a sample without comparison (`lower::sampler::Sampling::exact`, a
+    /// local deviation from the device's own sampling): its
+    /// [`SamplerWord`](crate::metal::sampler::SamplerWord) masked by `mask`
+    /// (`SamplerWord::exact_fetch`) is 0, a normalized sampler that filters nearest, clamps the
+    /// image's plane axes to the edge and reads one isotropic level. Every other sampler takes 0,
+    /// so samplers that differ in other ways share a pipeline, as do a slot bound to none.
+    SamplerExactFetch { slot: SlotRef, mask: u32 },
     /// The lanes an access of the sparse texture bound to the slot reads as constants
     /// (`u32`, default 0; `RuntimeFact::ConstantLanes`): bit `lane` (0 red to 3 alpha) where the
     /// lane's source through the texture's swizzle (`MTLTexture.swizzle`) is a channel its pixel

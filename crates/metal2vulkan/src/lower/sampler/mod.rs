@@ -96,9 +96,11 @@
 //! selects the fetch where its table entry's word states the state
 //! (`metal::sampler::SamplerWord::exact_fetch`); gathers and comparisons stay scaled.
 //! A runtime sampler slot's sample without comparison likewise also fetches at
-//! `clamp(floor(coord * size))` and selects the fetch where the slot's word states a normalized
-//! sampler that would fetch so ([`Sampling::exact`]): a local deviation from the device's own
-//! sampling (docs/FAST-PATHS.md), whose nearest texel at an edge is the device's otherwise.
+//! `clamp(floor(coord * size))` and selects the fetch where the slot's `SamplerExactFetch`
+//! specialization states a normalized sampler that would fetch so ([`Sampling::exact`]): a local
+//! deviation from the device's own sampling (docs/FAST-PATHS.md), whose nearest texel at an edge
+//! is the device's otherwise. Every other sampler specializes the boolean to 0, so it shares one
+//! pipeline and the driver drops the fetch.
 //!
 //! **Texel offsets**. Metal reads each component of an offset as the two's-complement value of its
 //! low four bits ([`metal_offset`]), which is the identity on its documented range
@@ -620,7 +622,8 @@ pub struct Sampling {
     /// A sample without comparison through a runtime sampler slot: the mask
     /// ([`SamplerWord::exact_fetch`]) under which the slot's word is 0 for a normalized sampler
     /// that reads one isotropic level, clamps each plane axis to the edge and filters nearest
-    /// (unless the texture is integer). Under it the sample reads its texel by a fetch at
+    /// (unless the texture is integer). Where the slot's `SpecKey::SamplerExactFetch`
+    /// specialization states it, the sample reads its texel by a fetch at
     /// `clamp(floor(coord * size))` instead of the device's sampler. A local deviation from the
     /// device's own sampling (docs/FAST-PATHS.md, the device sampler row): the device's
     /// normalized nearest sample reads the neighbouring texel at and just past a texel edge
@@ -1002,8 +1005,10 @@ pub struct RuntimeSlot {
     /// An emulated anisotropic sample reads it ([`anisotropic`]): the function reads its word's
     /// anisotropy and mip filter and its `SpecKey::SamplerAnisotropy` specialization.
     pub emulated: bool,
-    /// The masks of the samples that fetch their texel where its word states a normalized
-    /// nearest sampler clamped to the edge ([`Sampling::exact`]): the function reads those fields.
+    /// The union of the masks of the samples that fetch their texel where the bound sampler is a
+    /// normalized nearest one clamped to the edge ([`Sampling::exact`]): the mask of its
+    /// `SpecKey::SamplerExactFetch` specialization, 0 for none. A union only narrows which
+    /// samplers fetch.
     pub exact: u32,
 }
 
@@ -1030,7 +1035,7 @@ impl RuntimeSlot {
         if self.texels {
             fields |= SamplerWord::LINEAR_FILTER;
         }
-        fields | self.exact
+        fields
     }
 
     /// The slot's interface entry.
@@ -1142,6 +1147,9 @@ pub struct Declared {
     /// The `SamplerMinLevel` specialization constant (`u32`) of each runtime sampler slot a
     /// clamped LOD query outside a fragment function reads.
     pub min_levels: BTreeMap<u32, SValue>,
+    /// The `SamplerExactFetch` specialization constant (`u32`) of each runtime sampler slot a
+    /// sample's exact fetch reads ([`Sampling::exact`]).
+    pub exact_fetches: BTreeMap<u32, SValue>,
     /// The `SamplerAnisotropy` specialization constant (`u32`) of each runtime sampler slot an
     /// emulated anisotropic sample reads ([`anisotropic`]).
     pub degrees: BTreeMap<u32, SValue>,
@@ -1434,6 +1442,18 @@ pub fn declare(
             };
             let c = mb.spec(key, u, ConstBits(0))?;
             d.words.insert(*n, mb.const_value(c)?);
+        }
+        if r.exact != 0 {
+            let u = mb.ty(SType::Int {
+                width: 32,
+                signed: false,
+            })?;
+            let key = SpecKey::SamplerExactFetch {
+                slot: r.slot,
+                mask: r.exact,
+            };
+            let c = mb.spec(key, u, ConstBits(0))?;
+            d.exact_fetches.insert(*n, mb.const_value(c)?);
         }
         if r.min_level {
             let u = mb.ty(SType::Int {

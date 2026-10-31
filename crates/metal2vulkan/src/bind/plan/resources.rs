@@ -1776,6 +1776,14 @@ impl ResourcePlanner<'_> {
         u64::from(word & fields)
     }
 
+    /// The `SamplerExactFetch { slot, mask }` specialization: 1 where a sampler is bound to `slot`
+    /// and its word masked by `mask` is 0, else 0.
+    pub fn sampler_exact_fetch(&self, slot: SlotRef, mask: u32) -> u64 {
+        self.stage_shape(slot.stage)
+            .and_then(|s| s.samplers.get(&slot.index))
+            .map_or(0, |s| u64::from(s.word.0 & mask == 0))
+    }
+
     /// The `SamplerMinLevel(slot)` specialization: the level, in sixty-fourths, that Metal's
     /// `calculate_clamped_lod` answers outside a fragment function through the sampler bound to
     /// `slot` before the texture's last level bounds it; 0 for a slot bound to no sampler.

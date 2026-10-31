@@ -193,6 +193,7 @@ pub(crate) fn bound_value(
         SpecKey::Presence(slot) => u64::from(present(shape, slot)),
         SpecKey::SamplerState { slot, fields } => resources.sampler_state(slot, fields),
         SpecKey::SamplerMinLevel(slot) => resources.sampler_min_level(slot),
+        SpecKey::SamplerExactFetch { slot, mask } => resources.sampler_exact_fetch(slot, mask),
         SpecKey::SamplerAnisotropy(slot) => resources.sampler_anisotropy(slot),
         // An unbound slot, or one bound to a placeholder format, reads its neutral: its
         // out-of-bounds texel is all zero.

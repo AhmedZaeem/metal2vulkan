@@ -203,6 +203,13 @@ fn assert_half_rounding(a: &FunctionArtifact) {
 
 /// The fields of the `SamplerState` specialization the function declares for sampler slot `s`, if
 /// it declares one.
+fn exact_fetch_mask(a: &FunctionArtifact, s: SlotRef) -> Option<u32> {
+    a.interface.read_keys().into_iter().find_map(|k| match k {
+        SpecKey::SamplerExactFetch { slot, mask } if slot == s => Some(mask),
+        _ => None,
+    })
+}
+
 fn sampler_fields(a: &FunctionArtifact, s: SlotRef) -> Option<u32> {
     a.interface.read_keys().into_iter().find_map(|k| match k {
         SpecKey::SamplerState { slot, fields } if slot == s => Some(fields),
@@ -289,11 +296,12 @@ fn runtime_samplers_select_pixel_coordinates_by_specialization() {
         .facts
         .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
     assert!(a.facts.contains(&RuntimeFact::SamplerReduction { slot: s }));
-    // The coordinates bit, and the fields of the exact fetch a normalized nearest sampler
-    // clamped to the edge takes (`Sampling::exact`, a local deviation): otherwise the device's
-    // sampler reads the scaled coordinate.
+    // The coordinates bit alone: the device's sampler reads the scaled coordinate.
+    assert_eq!(sampler_fields(&a, s), Some(SamplerWord::PIXEL_COORDINATES));
+    // The exact fetch a normalized nearest sampler clamped to the edge takes is a boolean of its
+    // own (`Sampling::exact`, a local deviation), so the word's fields stay the coordinates'.
     assert_eq!(
-        sampler_fields(&a, s),
+        exact_fetch_mask(&a, s),
         Some(SamplerWord::exact_fetch(2, false))
     );
     assert!(a.precision.contains(&PrecisionNote::PixelSamplerScaling));
@@ -332,10 +340,9 @@ fn a_runtime_samplers_sample_is_the_device_s() {
     let (mut metal, mut device) = (0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
         let a = ok(&bc, "sample_level", &p);
-        // With the exact fetch's fields (`Sampling::exact`, a local deviation).
         assert_eq!(
             sampler_fields(&a, s),
-            Some(SamplerWord::exact_fetch(2, false)),
+            Some(SamplerWord::PIXEL_COORDINATES),
             "{stem}"
         );
         assert_eq!(uses(&a, "sampler.sample"), 1, "{stem}");
@@ -388,13 +395,7 @@ fn a_runtime_samples_level_is_the_device_s() {
         for (stem, p) in committed_profiles().expect("profiles") {
             let a = ok(&bc, "k", &p);
             let fields = sampler_fields(&a, s).unwrap_or(0);
-            // The exact fetch reads the mip filter, to tell a sampler that reads one level
-            // (`Sampling::exact`, a local deviation).
-            assert_eq!(
-                fields & levels & !SamplerWord::MIP_FILTER,
-                0,
-                "{name} {stem}"
-            );
+            assert_eq!(fields & levels, 0, "{name} {stem}");
         }
     }
 }
@@ -420,13 +421,11 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
         for (stem, p) in committed_profiles().expect("profiles") {
             let what = format!("{name} on {stem}");
             let a = ok(&bc, "k", &p);
-            // A sample also reads the exact fetch's fields (`Sampling::exact`, a local
-            // deviation).
-            let fields = match name {
-                "pixel_sample" => SamplerWord::exact_fetch(2, false),
-                _ => SamplerWord::PIXEL_COORDINATES,
-            };
-            assert_eq!(sampler_fields(&a, s), Some(fields), "{what}");
+            assert_eq!(
+                sampler_fields(&a, s),
+                Some(SamplerWord::PIXEL_COORDINATES),
+                "{what}"
+            );
             assert!(a
                 .facts
                 .contains(&RuntimeFact::SamplerCoordinates { slot: s }));
@@ -434,7 +433,10 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
                 a.precision.contains(&PrecisionNote::PixelSamplerScaling),
                 "{what}"
             );
-            let key = SpecKey::SamplerState { slot: s, fields };
+            let key = SpecKey::SamplerState {
+                slot: s,
+                fields: SamplerWord::PIXEL_COORDINATES,
+            };
             let held: Vec<&SpecializedNote> = a
                 .specialized
                 .iter()

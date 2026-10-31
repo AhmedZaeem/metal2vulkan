@@ -189,17 +189,34 @@ fn drawn(
     read.chunks(4).map(|texel| texel[3]).collect()
 }
 
-/// The alpha code a kernel reads at each coordinate, which it takes from a buffer
-/// (`mip_bias_kernel`, at bias 0).
-fn fetched_by_kernel(device: &Device, texture: &Texture, coords: &[[f32; 2]]) -> Vec<u8> {
+/// A state of `mip_bias_kernel`, which samples texture 0 through sampler 0 at each `float4` of
+/// buffer 0 (its `xy`, biased by its `z`) into buffer 1.
+fn kernel_state(device: &Device) -> crate::ComputePipelineState {
     let function = library(device, "engine/mip_level_sampling.ll")
         .new_function_with_name("mip_bias_kernel")
         .unwrap();
     let descriptor =
         ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
-    let state = device
+    device
         .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
-        .unwrap();
+        .unwrap()
+}
+
+/// The alpha code a kernel reads at each coordinate, which it takes from a buffer
+/// (`mip_bias_kernel`, at bias 0), through Java2D's sampler.
+fn fetched_by_kernel(device: &Device, texture: &Texture, coords: &[[f32; 2]]) -> Vec<u8> {
+    let state = kernel_state(device);
+    sampled_by_kernel(device, &state, texture, &nearest(device), coords)
+}
+
+/// The alpha code `state` reads at each coordinate through `sampler`.
+fn sampled_by_kernel(
+    device: &Device,
+    state: &crate::ComputePipelineState,
+    texture: &Texture,
+    sampler: &crate::SamplerState,
+    coords: &[[f32; 2]],
+) -> Vec<u8> {
     let n = coords.len() as u64;
     let params: Vec<f32> = coords
         .iter()
@@ -209,13 +226,12 @@ fn fetched_by_kernel(device: &Device, texture: &Texture, coords: &[[f32; 2]]) ->
     let out = device
         .new_buffer(n * 16, ResourceOptions::default())
         .unwrap();
-    let sampler = nearest(device);
     let queue = device.new_command_queue().unwrap();
     let command_buffer = queue.command_buffer().unwrap();
     let mut encoder = command_buffer.compute_command_encoder().unwrap();
-    encoder.set_compute_pipeline_state(&state).unwrap();
+    encoder.set_compute_pipeline_state(state).unwrap();
     encoder.set_texture(Some(texture), 0).unwrap();
-    encoder.set_sampler_state(Some(&sampler), 0).unwrap();
+    encoder.set_sampler_state(Some(sampler), 0).unwrap();
     encoder.set_buffer(Some(&params), 0, 0).unwrap();
     encoder.set_buffer(Some(&out), 0, 1).unwrap();
     encoder
@@ -337,4 +353,59 @@ fn a_nearest_sample_at_a_texel_edge_reads_the_texel_past_it() {
     }
     eprintln!("NEAREST-EDGES: {} wrong reads", wrong.len());
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The exact fetch costs no pipeline for a sampler it does not take: its slot's
+/// `SamplerExactFetch` specialization is a boolean, so samplers that differ in filters, address
+/// modes or mip filter share one `VkPipeline`, and a sampler it takes makes at most one more, which
+/// a matching sampler differing only in fields outside the mask shares.
+#[test]
+fn samplers_the_exact_fetch_does_not_take_share_one_pipeline() {
+    use metal2vulkan::metal::{
+        SamplerAddressMode as A, SamplerMinMagFilter as F, SamplerMipFilter as M,
+    };
+    let scratch = Scratch::new("nearest-texel-variants");
+    let device = device(&scratch.0);
+    let state = kernel_state(&device);
+    let texture = mask(&device);
+    let sampler = |edit: &dyn Fn(&mut SamplerDescriptor)| {
+        let mut d = SamplerDescriptor::new();
+        edit(&mut d);
+        device.new_sampler_state(&d).unwrap()
+    };
+    let others = [
+        sampler(&|d| {
+            d.min_filter = F::Linear;
+            d.mag_filter = F::Linear;
+        }),
+        sampler(&|d| d.t_address_mode = A::Repeat),
+        sampler(&|d| d.s_address_mode = A::MirrorRepeat),
+        sampler(&|d| d.mip_filter = M::Nearest),
+    ];
+    let made = || device.work_counts().variant_pipelines_made;
+    sampled_by_kernel(&device, &state, &texture, &others[0], &[CORNER]);
+    let first = made();
+    for other in &others[1..] {
+        sampled_by_kernel(&device, &state, &texture, other, &[CORNER]);
+    }
+    assert_eq!(
+        made(),
+        first,
+        "samplers the exact fetch does not take made pipelines"
+    );
+    sampled_by_kernel(&device, &state, &texture, &nearest(&device), &[CORNER]);
+    let exact = made();
+    assert!(
+        exact - first <= 1,
+        "the exact fetch made {} pipelines",
+        exact - first
+    );
+    let clamped = sampler(&|d| d.lod_max_clamp = 3.0);
+    sampled_by_kernel(&device, &state, &texture, &clamped, &[CORNER]);
+    assert_eq!(
+        made(),
+        exact,
+        "a matching sampler's other fields made a pipeline"
+    );
+    eprintln!("NEAREST-EDGES: pipelines: {first} after the first sampler, {exact} after the exact");
 }

@@ -981,10 +981,10 @@ pub(super) fn sampled_value(
             SampleOp::Sample {
                 dref: None, offset, ..
             },
-            Some(mask),
+            Some(_),
         ) => {
             let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm, true)?;
-            Some((Flagged::Slot(*n, mask), x, word))
+            Some((Flagged::Slot(*n), x, word))
         }
         _ => None,
     };
@@ -1093,11 +1093,18 @@ pub(super) fn sampled_value(
                             let state = heap_sampler_field(cx, fb, handle, EntryField::Flags)?;
                             word_states(fb, state, mask)?
                         }
-                        // A normalized nearest sampler clamped to the edge: the mask's fields
-                        // are all 0, pixel coordinates among them.
-                        Flagged::Slot(n, mask) => {
-                            let word = sampler_word(cx, fb, Pixel::Spec(n))?;
-                            word_clear(fb, word, mask)?
+                        // The slot's `SamplerExactFetch` specialization: a normalized nearest
+                        // sampler clamped to the edge.
+                        Flagged::Slot(n) => {
+                            let Some(on) = cx.decl.families.sampler.exact_fetches.get(&n).copied()
+                            else {
+                                return Err(cx.fail(format!(
+                                    "sampler slot {n} has no exact-fetch specialization"
+                                )));
+                            };
+                            let zero = fb.u32_const(0)?;
+                            let zero = fb.module().const_value(zero)?;
+                            fb.binary(BinOp::INotEqual, on, zero)?
                         }
                     };
                     let x = fb.select(take, fetched, x)?;
@@ -1265,22 +1272,12 @@ fn heap_sampler_field(
     entry_field(fb, table.table, k, field)
 }
 
-/// Whose word selects a sample's exact fetch: an argument buffer's sampler of a heap handle, or a
-/// runtime slot's under its exact-fetch mask (`Sampling::exact`).
+/// What selects a sample's exact fetch: an argument buffer's sampler of a heap handle, by its
+/// word, or a runtime slot's `SamplerExactFetch` specialization (`Sampling::exact`).
 #[derive(Clone, Copy)]
 enum Flagged {
     Heap(ValueId),
-    Slot(u32, u32),
-}
-
-/// Whether sampler word `word` masked by `mask` is 0 (a `bool`).
-fn word_clear(fb: &mut FunctionBuilder<'_>, word: SValue, mask: u32) -> BResult<SValue> {
-    let m = fb.u32_const(mask)?;
-    let m = fb.module().const_value(m)?;
-    let have = fb.binary(BinOp::BitwiseAnd, word, m)?;
-    let zero = fb.u32_const(0)?;
-    let zero = fb.module().const_value(zero)?;
-    fb.binary(BinOp::IEqual, have, zero)
+    Slot(u32),
 }
 
 /// Whether sampler word `word` masked by `mask` is exactly [`SamplerWord::PIXEL_COORDINATES`] (a

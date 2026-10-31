@@ -940,6 +940,69 @@ fn sampler_state_follows_the_bound_sampler() {
     assert!(!states(None));
 }
 
+/// A runtime sampler slot specializes `SamplerExactFetch` to 1 only for a bound sampler whose word
+/// the mask finds all 0: normalized, nearest, clamped to the edge on the mask's axes, one level,
+/// isotropic (`lower::sampler::Sampling::exact`, a local deviation). Every other sampler, and an
+/// unbound slot, takes 0, so they share a pipeline.
+#[test]
+fn sampler_exact_fetch_holds_only_for_a_normalized_nearest_clamped_sampler() {
+    use crate::bind::state::SamplerDescriptor;
+    use crate::metal::sampler::SamplerWord as W;
+    use crate::metal::{SamplerAddressMode as A, SamplerMinMagFilter as F, SamplerMipFilter as M};
+    let slot = SlotRef {
+        stage: Stage::Fragment,
+        class: SlotClass::Sampler,
+        index: 1,
+    };
+    let p =
+        crate::pipeline::testing::profile("moltenvk-m3", crate::device::DevicePolicy::default())
+            .expect("profile");
+    let slots = BTreeMap::from([(
+        slot,
+        SlotInterface::Sampler(SamplerSlot {
+            compare: false,
+            coordinate_sensitive: true,
+        }),
+    )]);
+    let plan = |desc: Option<SamplerDescriptor>| {
+        let mut stage = StageShape::default();
+        if let Some(d) = desc {
+            stage
+                .samplers
+                .insert(slot.index, BoundSampler::new(d).shape());
+        }
+        let shape = BTreeMap::from([(Stage::Fragment, stage)]);
+        let planner = ResourcePlanner {
+            profile: &p,
+            shape: &shape,
+            slots: &slots,
+            dependencies: &[],
+            stage_flags: |_| vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            variant: VariantKey::new(),
+            diagnostics: Vec::new(),
+            uses: Vec::new(),
+            template: Default::default(),
+            alpha_red_texels: Default::default(),
+        };
+        [W::exact_fetch(1, false), W::exact_fetch(2, false)]
+            .map(|mask| planner.sampler_exact_fetch(slot, mask))
+    };
+    let with = |edit: &dyn Fn(&mut SamplerDescriptor)| {
+        let mut d = SamplerDescriptor::new();
+        edit(&mut d);
+        Some(d)
+    };
+    assert_eq!(plan(with(&|_| {})), [1, 1]);
+    assert_eq!(plan(None), [0, 0]);
+    assert_eq!(plan(with(&|d| d.mag_filter = F::Linear)), [0, 0]);
+    assert_eq!(plan(with(&|d| d.normalized_coordinates = false)), [0, 0]);
+    assert_eq!(plan(with(&|d| d.mip_filter = M::Nearest)), [0, 0]);
+    assert_eq!(plan(with(&|d| d.max_anisotropy = 4)), [0, 0]);
+    // A 1D texture reads no `t` address mode.
+    assert_eq!(plan(with(&|d| d.t_address_mode = A::Repeat)), [1, 0]);
+    assert_eq!(plan(with(&|d| d.s_address_mode = A::MirrorRepeat)), [0, 0]);
+}
+
 /// A texture slot read or sampled with a `half` result specializes `TexelFormat` from the bound
 /// format's class, a texture buffer's included; an unbound slot and a format whose conversion is
 /// not measured take `TexelFormat::OTHER`.
