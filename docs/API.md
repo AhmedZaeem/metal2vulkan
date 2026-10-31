@@ -1238,7 +1238,11 @@ that reads its own pass's color attachment after a barrier took the split rather
 (id name `metal2vulkan-snapshot-fallback`, `Info` severity; `WorkCounts::reading_draws_snapshotted`
 counts those that took a snapshot), and now and then a count of the draws the snapshot's area rule
 weighed, by their scissors' share of the target, texel bytes and side of the rule (id name
-`metal2vulkan-snapshot-readers`, `Info` severity). With `METAL2VULKAN_LOG_MEMORY` set, a device
+`metal2vulkan-snapshot-readers`, `Info` severity). With `METAL2VULKAN_LOG_DIRTY_CENSUS` set, a
+device prints on stderr, once a second, the shadows over logged host pages whose copies in moved the
+most bytes (eight at most) and their total: each one's shape, the MiB a second its copies in and
+back moved, and its copies in by what they took (every row, by why, or none). With
+`METAL2VULKAN_LOG_MEMORY` set, a device
 logs one line per `VkDeviceMemory` it allocates, imports or frees (id name `metal2vulkan-memory`,
 `Info` severity): what it holds (a block of buffers or images, a host-memory import with its host
 address, a dma-buf import), its handle, memory type, bytes and device address range, where the

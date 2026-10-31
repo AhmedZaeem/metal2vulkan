@@ -45,7 +45,7 @@
 use super::device::lock;
 use super::gpu_time;
 use super::resource::ResourceKey;
-use super::shadow::ShadowCopies;
+use super::shadow::{ShadowCopies, ShadowSource, ShadowTarget};
 use super::tracker::Use;
 use ash::vk;
 use std::fmt;
@@ -363,6 +363,8 @@ pub(crate) struct ShadowLog {
     /// The host nanoseconds of its last use, a gated copy in recorded ([`DirtyShadows::log`]).
     last_used: AtomicU64,
     tally: Arc<DirtyTally>,
+    /// What its copies moved since the census last printed it (`METAL2VULKAN_LOG_DIRTY_CENSUS`).
+    census: Census,
     /// The stamp as of which the image holds every texel of the truth, but for the pages the log
     /// reports changed since (the module docs); `None` where it holds nothing a copy may count on.
     hold: Mutex<Hold>,
@@ -370,6 +372,104 @@ pub(crate) struct ShadowLog {
     /// may run after work submitted later, until each completes: while any does, the hold stays
     /// let go of and no copy in counts on it ([`DirtyShadows::planned`]).
     unsettled: AtomicU64,
+}
+
+/// What one shadow's gated copies in and copies back moved since the census last printed them,
+/// and why each copy in that took every row did ([`DirtyShadows::log`],
+/// `METAL2VULKAN_LOG_DIRTY_CENSUS`): a diagnostic, which nothing reads to decide.
+#[derive(Default)]
+struct Census {
+    copies: AtomicU64,
+    /// Recorded before its submission decided (a settle's replay).
+    unplanned: AtomicU64,
+    /// No hold to count on.
+    no_hold: AtomicU64,
+    /// Its stamp not published at its replay.
+    unpublished: AtomicU64,
+    /// The rows changed came to half or more, or to too many bands.
+    most_rows: AtomicU64,
+    skipped: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_back: AtomicU64,
+}
+
+/// Why a gated copy in took every row ([`Census`]).
+#[derive(Clone, Copy)]
+enum Whole {
+    Unplanned,
+    NoHold,
+    Unpublished,
+    MostRows,
+}
+
+impl Census {
+    fn whole(&self, why: Whole) {
+        let count = match why {
+            Whole::Unplanned => &self.unplanned,
+            Whole::NoHold => &self.no_hold,
+            Whole::Unpublished => &self.unpublished,
+            Whole::MostRows => &self.most_rows,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Its counts, each set back to 0.
+    fn take(&self) -> [u64; 8] {
+        [
+            &self.copies,
+            &self.unplanned,
+            &self.no_hold,
+            &self.unpublished,
+            &self.most_rows,
+            &self.skipped,
+            &self.bytes_in,
+            &self.bytes_back,
+        ]
+        .map(|count| count.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Whether the census of the logged shadows' copies prints (`METAL2VULKAN_LOG_DIRTY_CENSUS`).
+fn census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(metal2vulkan::env_vars::log_dirty_census)
+}
+
+/// How often the census prints.
+const CENSUS_NANOS: u64 = 1_000_000_000;
+
+/// The census lines of `logs`, the most bytes copied in first, eight at most, and a total.
+fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
+    let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20) / seconds;
+    let mut rows: Vec<(String, [u64; 8])> = (logs.iter())
+        .map(|log| (log.census_name(), log.census.take()))
+        .filter(|(_, counts)| counts.iter().any(|&count| count != 0))
+        .collect();
+    rows.sort_by_key(|(_, counts)| std::cmp::Reverse(counts[6]));
+    let mut total = [0u64; 8];
+    for (_, counts) in &rows {
+        for (sum, count) in total.iter_mut().zip(counts) {
+            *sum += count;
+        }
+    }
+    let line = |name: &str, c: &[u64; 8]| {
+        format!(
+            "m2v dirty census {name}: in {:.1} MiB/s, back {:.1} MiB/s; copies in {}/s: whole for              no hold {}, unpublished {}, most rows {}, unplanned {}; skipped {}",
+            mib(c[6]),
+            mib(c[7]),
+            c[0],
+            c[2],
+            c[3],
+            c[4],
+            c[1],
+            c[5],
+        )
+    };
+    let mut lines: Vec<String> = (rows.iter().take(8))
+        .map(|(name, counts)| line(name, counts))
+        .collect();
+    lines.push(line(&format!("all {} shadows", rows.len()), &total));
+    lines
 }
 
 /// How long a shadow's log goes without a gated copy in before it lets go of its watch.
@@ -387,6 +487,43 @@ impl Drop for ShadowLog {
 }
 
 impl ShadowLog {
+    /// Its shadow's shape for the census: texels, rows' bytes, its truth's bytes, and whether a
+    /// home is shared or watched.
+    fn census_name(&self) -> String {
+        let shape = self
+            .copies
+            .upgrade()
+            .and_then(|copies| match &copies.source {
+                ShadowSource::Bytes {
+                    target: ShadowTarget::Image { regions, texel, .. },
+                    ..
+                } => {
+                    let region = regions.first()?;
+                    let texel = (*texel)?;
+                    let extent = region.image_extent;
+                    let rows = match region.buffer_row_length {
+                        0 => u64::from(extent.width) * texel,
+                        row => u64::from(row) * texel,
+                    };
+                    let shared = copies.shared.load(Ordering::Relaxed);
+                    Some(format!(
+                        "{}x{} rows {rows}{}",
+                        extent.width,
+                        extent.height,
+                        if shared { " shared" } else { "" }
+                    ))
+                }
+                _ => None,
+            });
+        let watched = lock(&self.watch).is_some();
+        format!(
+            "{} ({:.1} MB{})",
+            shape.unwrap_or_else(|| "gone".to_owned()),
+            self.bytes() as f64 / 1e6,
+            if watched { "" } else { ", unwatched" }
+        )
+    }
+
     /// How many bytes it watches while it watches.
     fn bytes(&self) -> u64 {
         self.truth.end.saturating_sub(self.truth.start)
@@ -479,6 +616,13 @@ impl ShadowLog {
     }
 }
 
+/// Print the census's lines, on stderr.
+fn print_census(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
 /// The logs of a device's shadows over logged host pages, by the shadow's key: made at a shadow's
 /// first copy in over such pages, and let go of once the shadow went.
 #[derive(Default)]
@@ -489,6 +633,8 @@ pub(crate) struct DirtyShadows {
     tally: Arc<DirtyTally>,
     /// The host nanoseconds the logs were last looked over for idle watches.
     swept: AtomicU64,
+    /// The host nanoseconds the census last printed.
+    census_at: AtomicU64,
 }
 
 /// The gated copies in, as `WorkCounts::dirty_copies_in_gated` and kin count them.
@@ -547,9 +693,19 @@ impl DirtyShadows {
         logs.retain(|log| log.copies.strong_count() > 0);
         // Dropped once the logs are let go of: a watch's drop is the consumer's code.
         let mut idle: Vec<Box<dyn Send + Sync>> = Vec::new();
+        let mut census = Vec::new();
         if now.saturating_sub(self.swept.load(Ordering::Relaxed)) >= IDLE_SWEEP_NANOS {
             self.swept.store(now, Ordering::Relaxed);
             idle.extend(logs.iter().filter_map(|log| log.idle_watch(now)));
+            let last = self.census_at.load(Ordering::Relaxed);
+            if census_on() && now.saturating_sub(last) >= CENSUS_NANOS {
+                self.census_at.store(now, Ordering::Relaxed);
+                let seconds = match last {
+                    0 => 1.0,
+                    last => now.saturating_sub(last) as f64 / 1e9,
+                };
+                census = census_lines(&logs, seconds);
+            }
         }
         let kept = logs.iter().position(|log| {
             std::ptr::eq(log.copies.as_ptr(), Arc::as_ptr(copies))
@@ -561,6 +717,7 @@ impl DirtyShadows {
             let log = Arc::clone(&logs[at]);
             drop(logs);
             drop(idle);
+            print_census(&census);
             log.used(now);
             return Some(log);
         }
@@ -576,6 +733,7 @@ impl DirtyShadows {
             watch: Mutex::new(Some(source.hook.watch(offsets.clone()))),
             last_used: AtomicU64::new(now),
             tally: Arc::clone(&self.tally),
+            census: Census::default(),
             hold: Mutex::new(Hold::default()),
             unsettled: AtomicU64::new(0),
         });
@@ -585,6 +743,7 @@ impl DirtyShadows {
         self.any.store(true, Ordering::Release);
         drop(logs);
         drop(idle);
+        print_census(&census);
         Some(log)
     }
 
@@ -631,6 +790,8 @@ impl DirtyShadows {
     pub(crate) fn stamped(&self, commit: &mut DirtyCommit, held: &[Arc<ShadowCopies>]) {
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
+            let bytes = range.end.saturating_sub(range.start);
+            log.census.bytes_back.fetch_add(bytes, Ordering::Relaxed);
         }
         let mut stamps: Vec<(Arc<DirtySource>, DirtyStamp)> = Vec::new();
         let mut stamp_of = |source: &Arc<DirtySource>| match (stamps.iter())
@@ -908,7 +1069,12 @@ impl CopyInGate {
                 .sum()
         };
         let total = bytes(whole);
+        let census = &self.log.census;
+        census.copies.fetch_add(1, Ordering::Relaxed);
         let decision = *lock(&self.decision);
+        if decision.is_none() {
+            census.whole(Whole::Unplanned);
+        }
         let changed = decision.and_then(|Decision { since, stamp }| {
             // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
             // submission set to its own stamp ([`DirtyShadows::planned`]).
@@ -922,8 +1088,12 @@ impl CopyInGate {
             if !published && self.held.load(Ordering::Relaxed) {
                 (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
             }
-            let since = since?;
+            let Some(since) = since else {
+                census.whole(Whole::NoHold);
+                return None;
+            };
             if !published {
+                census.whole(Whole::Unpublished);
                 return None;
             }
             let mut runs = Vec::new();
@@ -932,21 +1102,23 @@ impl CopyInGate {
         });
         let Some(runs) = changed else {
             out.extend_from_slice(whole);
+            census.bytes_in.fetch_add(total, Ordering::Relaxed);
             return (total, total);
         };
-        for region in whole {
-            if !self.bands(region, &runs, out) {
-                out.clear();
-                out.extend_from_slice(whole);
-                return (total, total);
-            }
-        }
-        if out.len() > REGIONS {
+        let banded = whole.iter().all(|region| self.bands(region, &runs, out));
+        if !banded || out.len() > REGIONS {
             out.clear();
             out.extend_from_slice(whole);
+            census.whole(Whole::MostRows);
+            census.bytes_in.fetch_add(total, Ordering::Relaxed);
             return (total, total);
         }
-        (total, bytes(out))
+        let copied = bytes(out);
+        census.bytes_in.fetch_add(copied, Ordering::Relaxed);
+        if out.is_empty() {
+            census.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        (total, copied)
     }
 
     /// The full-width bands of `region`'s rows that the source's changed `runs` meet, into

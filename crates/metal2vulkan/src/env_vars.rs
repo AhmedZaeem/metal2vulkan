@@ -49,6 +49,17 @@ pub const REGISTRY: &[EnvVar] = &[
                  share of their colors' pixels and texel bytes; set to anything but empty or 0",
     },
     EnvVar {
+        name: "METAL2VULKAN_LOG_DIRTY_CENSUS",
+        default: "unset (off)",
+        effect: "metal2vulkan-runtime's diagnostics: once a second, on stderr, the shadows over \
+                 logged host pages (`HostMemory::with_dirty_pages`) whose copies in moved the \
+                 most bytes, eight at most, and their total: each one's texels, rows, bytes and \
+                 whether a home is shared or watched, the MiB a second its copies in and copies \
+                 back moved, its copies in, those that took every row by why (no hold, its stamp \
+                 unpublished, most rows changed, recorded before its submission decided) and those \
+                 that took none; set to anything but empty or 0",
+    },
+    EnvVar {
         name: "METAL2VULKAN_LOG_MEMORY",
         default: "unset (off)",
         effect: "metal2vulkan-runtime's diagnostics: one line per VkDeviceMemory a device \
@@ -90,6 +101,14 @@ pub fn lane_validation() -> Option<OsString> {
 /// neither empty nor `0`. A default-off diagnostic: it changes no pipeline, only what is printed.
 pub fn log_pipelines() -> bool {
     std::env::var_os("METAL2VULKAN_LOG_PIPELINES")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether `METAL2VULKAN_LOG_DIRTY_CENSUS` asks the runtime for its census of the copies of
+/// shadows over logged host pages: set to anything but empty or `0`. A default-off diagnostic:
+/// it changes no copy, only what is printed.
+pub fn log_dirty_census() -> bool {
+    std::env::var_os("METAL2VULKAN_LOG_DIRTY_CENSUS")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
