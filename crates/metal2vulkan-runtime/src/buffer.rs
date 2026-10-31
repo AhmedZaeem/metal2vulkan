@@ -63,11 +63,11 @@ pub struct Buffer(Arc<BufferShared>);
 
 /// A buffer held without keeping it (`used_resources.rs`).
 #[derive(Clone)]
-pub(super) struct WeakBuffer(Weak<BufferShared>);
+pub struct WeakBuffer(Weak<BufferShared>);
 
 impl WeakBuffer {
     /// The buffer, while it lives.
-    pub(super) fn upgrade(&self) -> Option<Buffer> {
+    pub fn upgrade(&self) -> Option<Buffer> {
         self.0.upgrade().map(Buffer)
     }
 
@@ -3164,7 +3164,7 @@ impl Buffer {
     }
 
     /// A handle that does not keep the buffer (`WeakBuffer`).
-    pub(super) fn downgrade(&self) -> WeakBuffer {
+    pub fn downgrade(&self) -> WeakBuffer {
         WeakBuffer(Arc::downgrade(&self.0))
     }
 
