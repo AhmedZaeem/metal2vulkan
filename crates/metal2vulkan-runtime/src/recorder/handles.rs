@@ -159,8 +159,11 @@ pub(super) unsafe fn free(indices: &[u32]) {
         }
         // SAFETY: made by `Box::into_raw` in `make`, taken out of the table just now.
         let mut log = unsafe { Box::from_raw(log) };
-        // Its hold on its replays goes: never their last, which their command buffer holds.
+        // Its hold on its replays goes: never their last, which their command buffer holds. So
+        // do its gates, whose siblings' images (`dirty_pages.rs`) a kept log held until another
+        // command buffer took it, however long that was.
         log.disown();
+        log.drop_gates();
         if free.logs.len() < KEPT_LOGS {
             free.logs.push(Kept(log));
         }

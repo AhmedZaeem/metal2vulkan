@@ -4494,6 +4494,7 @@ impl CommandBufferShared {
             if self.device.shared().dirty.any() {
                 let mut dirty = lock(&self.dirty);
                 (self.device.shared().dirty).completed(&mut dirty, result.is_err());
+                (self.device.shared().dirty).let_go(&mut dirty);
             }
             match result {
                 Ok(()) => {

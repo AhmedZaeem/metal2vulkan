@@ -384,6 +384,11 @@ impl Log {
     }
 
     /// Empty it for a new command buffer of `level`, keeping its arenas' room.
+    /// Let go of its gates (`dirty_pages.rs`), freed: nothing replays it again.
+    pub(super) fn drop_gates(&mut self) {
+        self.gates.clear();
+    }
+
     pub(super) fn clear(&mut self, level: vk::CommandBufferLevel) {
         self.stage = Stage::Initial;
         self.level = level;

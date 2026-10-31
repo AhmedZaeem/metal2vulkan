@@ -865,6 +865,12 @@ impl DirtyShadows {
         }
     }
 
+    /// Let go of `commit`'s gates, its command buffer completed: their siblings' images
+    /// (`Sibling`), which the command buffer's object would hold as long as the program keeps it.
+    pub(crate) fn let_go(&self, commit: &mut DirtyCommit) {
+        commit.gates.clear();
+    }
+
     /// The log kept for `copies`, where its copies in made one.
     pub(crate) fn kept(&self, copies: &ShadowCopies) -> Option<Arc<ShadowLog>> {
         let logs = lock(&self.logs);
