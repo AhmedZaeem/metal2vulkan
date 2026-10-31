@@ -139,6 +139,8 @@ mod host_settable_event_waits;
 mod host_shadow;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod host_step_neutrals;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod idle_queue_moves;
 mod image_barriers;
 mod image_plan;
 mod in_place;

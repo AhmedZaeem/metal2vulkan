@@ -28,6 +28,15 @@
 //! graphics queue), queues share and the waiting stands; each queue that takes a `VkQueue`
 //! another live queue holds is counted (`WorkCounts::queues_sharing_a_vk_queue`).
 //!
+//! A queue that shares one leaves it while idle: as it makes a command buffer with every earlier
+//! one completed, where another queue's work is in flight on its `VkQueue`, it moves to a round
+//! robin `VkQueue` of the same family with none in flight, if there is one, and stays there
+//! (`Device::idle_queue_moves`, counted, `WorkCounts::idle_queues_moved`). A queue that submits
+//! now and then, a frame at a time, then waits for none of a busy queue's long command buffers,
+//! while the busy queue, never idle, keeps its `VkQueue`. Its own order needs nothing more: every
+//! command buffer it committed before completed. A queue whose `VkQueue` the caller used
+//! (`with_vk_queue`) never moves, nor does a presenting queue.
+//!
 //! A queue holds at most its `maxCommandBufferCount` uncompleted command buffers, as Metal's does
 //! (measured on an M3 Max with macOS 26.7 and an M4 with macOS 27.0.1, with and without API
 //! validation):
@@ -61,7 +70,7 @@ use super::device::{lock, Device};
 use super::error::{Error, Invalid, Problem};
 use super::texture::copy_images::CopyImages;
 use super::texture::kept_image::KeptImages;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -85,8 +94,14 @@ struct QueueShared {
     device: Device,
     /// The queue's identity among the device's logical queues.
     id: u64,
-    /// The index of the device's `VkQueue` the queue submits to.
-    vk_queue: usize,
+    /// The index of the device's `VkQueue` the queue submits to. It changes only as a command
+    /// buffer is made with no other uncompleted (under its slots' lock), and only while the queue
+    /// is not pinned: no command buffer of the queue reads it across the change.
+    vk_queue: AtomicUsize,
+    /// The caller used its `VkQueue` (`CommandQueue::with_vk_queue`, set under its slots' lock):
+    /// what it submitted there is ordered with the queue's command buffers by that `VkQueue`
+    /// alone, so the queue never moves.
+    pinned: AtomicBool,
     label: Mutex<Option<String>>,
     /// The slots its uncompleted command buffers hold.
     slots: Arc<Slots>,
@@ -276,7 +291,8 @@ impl Device {
         CommandQueue(Arc::new(QueueShared {
             device: self.clone(),
             id,
-            vk_queue,
+            vk_queue: AtomicUsize::new(vk_queue),
+            pinned: AtomicBool::new(false),
             label: Mutex::new(None),
             slots: Slots::new(count, Arc::clone(&self.shared().uncommitted)),
             latest_gpu_end: Mutex::new(0),
@@ -294,7 +310,7 @@ impl Drop for QueueShared {
         // Every command buffer of the queue holds it, so none is left: no lease holds its pools'
         // blocks (`gpu_pools.rs`), and its `VkQueue` is free for a new queue.
         self.device.forget_queue_pools(self.id);
-        self.device.queue_gone(self.vk_queue);
+        self.device.queue_gone(*self.vk_queue.get_mut());
     }
 }
 
@@ -337,6 +353,9 @@ impl CommandQueue {
         let slots = &self.0.slots;
         let mut held = slots.lock();
         if let Some(slot) = slots.take(&mut held) {
+            if held.all == 1 {
+                self.move_while_idle();
+            }
             return Ok(slot);
         }
         let waited = Instant::now();
@@ -389,7 +408,29 @@ impl CommandQueue {
 
     /// The index of the device's `VkQueue` the queue submits to.
     pub(super) fn vk_queue(&self) -> usize {
-        self.0.vk_queue
+        self.0.vk_queue.load(Ordering::Acquire)
+    }
+
+    /// Under the slots' lock, as the queue's one uncompleted command buffer takes its slot: every
+    /// command buffer before it completed, so none waits on its `VkQueue` and none reads it again.
+    /// Where another queue's work is in flight on that `VkQueue`, the queue moves to one of the
+    /// round robin's with none, if there is one (`Device::idle_queue_moves`), and its command
+    /// buffers from this one on run there, waiting for none of that work. A pinned queue stays.
+    fn move_while_idle(&self) {
+        if self.0.pinned.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(to) = self.0.device.idle_queue_moves(self.vk_queue()) {
+            self.0.vk_queue.store(to, Ordering::Release);
+        }
+    }
+
+    /// The queue's `VkQueue` for the caller's own use (`with_vk_queue`): pinned under the slots'
+    /// lock first, so it never moves after.
+    pub(super) fn pinned_vk_queue(&self) -> usize {
+        let _held = self.0.slots.lock();
+        self.0.pinned.store(true, Ordering::Release);
+        self.vk_queue()
     }
 
     /// The backings of memoryless attachments the queue keeps for its passes

@@ -192,6 +192,7 @@ pub(crate) struct Counters {
     slot_return_nanos: AtomicU64,
     slot_waits: AtomicU64,
     queues_sharing_a_vk_queue: AtomicU64,
+    idle_queues_moved: AtomicU64,
     slot_wait_nanos: AtomicU64,
     completed_waits: AtomicU64,
     event_waits_met: AtomicU64,
@@ -1452,6 +1453,12 @@ impl Counters {
     pub(crate) fn queue_shared_a_vk_queue(&self) {
         self.queues_sharing_a_vk_queue
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A logical queue with no uncompleted command buffer left a `VkQueue` with another queue's
+    /// work in flight for one with none (`Device::idle_queue_moves`).
+    pub(crate) fn idle_queue_moved(&self) {
+        self.idle_queues_moved.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A batch with work was submitted waiting for `waits` timelines at values the host saw them
@@ -3764,6 +3771,10 @@ pub struct WorkCounts {
     /// the device took `VkQueue`s shares them (`queue.rs`, `device/create.rs`). Zero while a
     /// `VkQueue` is free for each.
     pub queues_sharing_a_vk_queue: u64,
+    /// Command buffers made on a queue with no uncompleted command buffer that moved the queue
+    /// off a `VkQueue` it shared, where another queue's work was in flight, to one with none in
+    /// flight, so that they wait for none of it (`queue.rs`).
+    pub idle_queues_moved: u64,
     /// The waits batches with work made for timelines at values the host had seen them reach,
     /// which make what completed work wrote visible to them: one per timeline whose completed
     /// value moved since a batch of the same `VkQueue` last waited for it.
@@ -5257,6 +5268,7 @@ impl Device {
             slot_waits: counters.slot_waits.load(Ordering::Relaxed),
             slot_wait_nanos: counters.slot_wait_nanos.load(Ordering::Relaxed),
             queues_sharing_a_vk_queue: counters.queues_sharing_a_vk_queue.load(Ordering::Relaxed),
+            idle_queues_moved: counters.idle_queues_moved.load(Ordering::Relaxed),
             completed_waits: counters.completed_waits.load(Ordering::Relaxed),
             event_waits_met: counters.event_waits_met.load(Ordering::Relaxed),
             shared_event_waits_held: counters.shared_event_waits_held.load(Ordering::Relaxed),

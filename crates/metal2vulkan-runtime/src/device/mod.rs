@@ -1118,6 +1118,37 @@ impl Device {
         }
     }
 
+    /// Where a logical queue with no uncompleted command buffer holds the round robin `VkQueue`
+    /// at `from` with another live logical queue, and work is in flight there (submitted and not
+    /// seen complete, so another queue's), a round robin `VkQueue` of `from`'s family with none
+    /// in flight, the one the fewest live logical queues hold, the first of those: the queue's
+    /// place moves there ([`queue_gone`](Self::queue_gone) then gives that one back), counted
+    /// (`WorkCounts::idle_queues_moved`). `None`, nothing changed, where it holds `from` alone,
+    /// nothing is in flight there, `from` is reserved for presenting, or every other such
+    /// `VkQueue` has work in flight.
+    pub(super) fn idle_queue_moves(&self, from: usize) -> Option<usize> {
+        let mut live = lock(&self.0.round_robin_live);
+        if live.get(from).is_none_or(|&held| held < 2) || !self.work_in_flight(from) {
+            return None;
+        }
+        let family = self.0.queues[from].family;
+        let (to, _) = (live.iter().copied().enumerate())
+            .filter(|&(at, _)| {
+                at != from && self.0.queues[at].family == family && !self.work_in_flight(at)
+            })
+            .min_by_key(|&(_, held)| held)?;
+        live[from] -= 1;
+        live[to] += 1;
+        self.0.counts.idle_queue_moved();
+        Some(to)
+    }
+
+    /// Whether a batch submitted to the device's `VkQueue` at `at` is not seen complete yet.
+    pub(crate) fn work_in_flight(&self, at: usize) -> bool {
+        let queue = &self.0.queues[at];
+        queue.submitted_value() > queue.completed_value()
+    }
+
     /// A new presenting queue's identity, and the index of the `VkQueue` it submits to: the
     /// queues reserved for presenting, in turn. `None` where the device reserved none.
     pub(super) fn next_presenting_queue(&self) -> Option<(u64, usize)> {
