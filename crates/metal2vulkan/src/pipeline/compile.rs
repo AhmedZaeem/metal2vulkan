@@ -44,7 +44,6 @@ use crate::library::{
     CompiledFunction, DynamicLibrary, Function, FunctionArtifact, FunctionCompileKey,
     FunctionConstantValues, KernelFacts,
 };
-use crate::lower::dispatch::LocalSizeForm;
 use crate::lower::select::{LowerInputs, Plan};
 use crate::pipeline::artifact::{PrecisionNote, StrategyCensus, StrategyUse};
 use crate::pipeline::compile::key::{DynamicKey, LinkedKey};
@@ -2475,7 +2474,7 @@ fn plan_one(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Planned
         flat_local_size: plan
             .dispatch
             .as_ref()
-            .is_some_and(|d| d.local_size == LocalSizeForm::Flat),
+            .is_some_and(|d| d.local_size.flattened()),
         // The static part: the objects, and with `[[threadgroup(n)]]` regions the 16-byte-aligned
         // offset where the first region starts. With typed threadgroup objects (no regions), the
         // static part of Metal's own layout, which holds them too.

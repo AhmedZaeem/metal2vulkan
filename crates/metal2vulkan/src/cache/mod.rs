@@ -167,6 +167,12 @@ pub struct VariantKey {
     /// `BindError::NeedsVariant`), and the plan of a pipeline compiled under it states it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_simdgroups: bool,
+    /// The kernel's Vulkan workgroup is `(sx·sy·sz, 1, 1)` whatever its tier: a dispatch whose
+    /// threadgroup passes the device's `maxComputeWorkGroupSize` on an axis, while its threads fit
+    /// `maxComputeWorkGroupInvocations`, asks for it (`BindingPlan::dispatch_variant`,
+    /// `BindError::NeedsVariant`), and the plan of a pipeline compiled under it states it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub flat_local: bool,
     /// The vertex function's `[[render_target_array_index]]` output is not written: in a pass of at
     /// most one layer (`BindShape::render_target_array_length` 0 or 1) every index renders slice 0,
     /// so a pipeline whose vertex function chooses its slice runs on this variant there, and only
@@ -524,6 +530,7 @@ impl VariantKey {
             && self.psb_slots.is_empty()
             && self.pulled_vertex_buffers.is_empty()
             && !self.emulated_simdgroups
+            && !self.flat_local
             && !self.dropped_vertex_layer
             && self.storage_view_slots.is_empty()
             && self.srgb_textures.is_empty()
@@ -594,6 +601,7 @@ impl VariantKey {
             .collect();
         out.emulated_simdgroups =
             self.emulated_simdgroups && stage == crate::pipeline::sym::Stage::Kernel;
+        out.flat_local = self.flat_local && stage == crate::pipeline::sym::Stage::Kernel;
         out.flat_grid = self.flat_grid && stage == crate::pipeline::sym::Stage::Kernel;
         out.folded_groups = self.folded_groups && stage == crate::pipeline::sym::Stage::Kernel;
         out.replay_bindings = self.replay_bindings

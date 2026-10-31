@@ -29,6 +29,14 @@
 //! `LocalSizeConstraint{multiple}` (`ComputeDerivatives` outside the flattened tiers). Metal's
 //! nominal size must be 1..=1024 per axis (the `DispatchRegion` packing).
 //!
+//! **Tall threadgroups.** Metal takes any threadgroup shape of up to its total; Vulkan bounds each
+//! axis too (an NVIDIA GPU's `z` at 64). A dispatch outside the flattened tiers with a region past
+//! an axis's limit, whose regions all pass the flattened checks, runs whole on the kernel's
+//! flat-local variant (`VariantKey::flat_local`, `RuntimeFact::FlatLocal`), whose workgroup is
+//! `(x·y·z, 1, 1)`: [`BindingPlan::dispatch_variant`] names it, and instantiating the dispatch on
+//! another plan is `BindError::NeedsVariant`. A region of a derivative group (a 2D shape) or of a
+//! tile function keeps its own refusal, as does one the flattened checks refuse too.
+//!
 //! **Partial simdgroups**. A flattened tier runs whole subgroups of its size `S` only, so a
 //! dispatch with a region whose `sn` is not a multiple of `S` (a partial simdgroup, or in
 //! `Cluster32` simdgroups that do not fill a subgroup) runs on the kernel's emulated-simdgroups
@@ -230,6 +238,23 @@ pub(crate) enum Fit {
     /// The kernel's emulated-simdgroups variant: a region's threadgroup is not whole subgroups of
     /// the flattened tier's size.
     EmulatedSimdgroups,
+    /// The kernel's flat-local variant: a region's threadgroup passes the device's
+    /// `maxComputeWorkGroupSize` on an axis, and its threads fit the flattened workgroup.
+    FlatLocal,
+    /// Both variants at once: the emulated-simdgroups variant's region passes an axis's limit.
+    EmulatedFlatLocal,
+}
+
+impl Fit {
+    /// The dispatch runs on the emulated-simdgroups variant.
+    pub(crate) fn emulated(self) -> bool {
+        matches!(self, Self::EmulatedSimdgroups | Self::EmulatedFlatLocal)
+    }
+
+    /// The dispatch runs on the flat-local variant.
+    pub(crate) fn flat_local(self) -> bool {
+        matches!(self, Self::FlatLocal | Self::EmulatedFlatLocal)
+    }
 }
 
 /// A flattened tier's region of local size `r` that is not whole subgroups of its size: every
@@ -263,18 +288,46 @@ fn emulated_rules(rules: &LocalRules) -> LocalRules {
 /// least 1), with every region checked against that pipeline's rules. A flattened tier's dispatch
 /// with a region that is not whole subgroups runs whole on the emulated-simdgroups variant, so each
 /// of its regions is checked against the variant's rules ([`emulated_rules`]).
+///
+/// A pipeline whose workgroup is not flattened, with no derivative group and not a tile function,
+/// runs a region past an axis's `maxComputeWorkGroupSize` on its flat-local variant
+/// (`VariantKey::flat_local`), whose workgroup is `(x·y·z, 1, 1)`, where every region fits that
+/// variant's rules ([`flat_rules`]); one that does not keeps its own refusal.
 pub(crate) fn fit(rules: &LocalRules, locals: &[[u32; 3]]) -> Result<Fit, BindError> {
-    if locals.iter().any(|&r| partial(rules, r)) {
-        let emulated = emulated_rules(rules);
-        for &r in locals {
-            check_local(&emulated, r)?;
+    let emulated = locals.iter().any(|&r| partial(rules, r));
+    let rules = match emulated {
+        true => emulated_rules(rules),
+        false => rules.clone(),
+    };
+    let checked = locals.iter().try_for_each(|&r| check_local(&rules, r));
+    match (checked, emulated) {
+        (Ok(()), false) => Ok(Fit::Planned),
+        (Ok(()), true) => Ok(Fit::EmulatedSimdgroups),
+        (Err(e), _) => {
+            let flat = flat_rules(&rules);
+            let fits = flattens(&rules) && locals.iter().all(|&r| check_local(&flat, r).is_ok());
+            match (fits, emulated) {
+                (true, false) => Ok(Fit::FlatLocal),
+                (true, true) => Ok(Fit::EmulatedFlatLocal),
+                // Where flattening does not run it either, the region's own refusal stands.
+                (false, _) => Err(e),
+            }
         }
-        Ok(Fit::EmulatedSimdgroups)
-    } else {
-        for &r in locals {
-            check_local(rules, r)?;
-        }
-        Ok(Fit::Planned)
+    }
+}
+
+/// Whether a pipeline of `rules` may run on its flat-local variant: its workgroup is not flattened,
+/// it keeps no derivative group's 2D shape, and it is not a tile function.
+fn flattens(rules: &LocalRules) -> bool {
+    !rules.flat && rules.multiples.is_empty() && !rules.tile
+}
+
+/// The local-size rules of a pipeline's flat-local variant as its own plan knows them: the same
+/// device limits and subgroups over a flattened workgroup.
+fn flat_rules(rules: &LocalRules) -> LocalRules {
+    LocalRules {
+        flat: true,
+        ..rules.clone()
     }
 }
 
@@ -420,6 +473,8 @@ pub(crate) struct Planned {
     pub nominal: [u32; 3],
     /// Some region runs only on the kernel's emulated-simdgroups variant.
     pub emulated: bool,
+    /// Some region runs only on the kernel's flat-local variant.
+    pub flat_local: bool,
 }
 
 /// The widest tile threadgroup, and the tallest: Metal's largest tile, 32x32.
@@ -519,8 +574,9 @@ pub(crate) fn regions(
         }
     }
     let empty = |v: [u32; 3]| v.contains(&0);
-    let planned = |regions: Vec<Region>, grid, emulated: bool| Planned {
-        emulated: emulated && !regions.is_empty(),
+    let planned = |regions: Vec<Region>, grid, fit: Fit| Planned {
+        emulated: fit.emulated() && !regions.is_empty(),
+        flat_local: fit.flat_local() && !regions.is_empty(),
         regions,
         grid,
         nominal,
@@ -530,18 +586,14 @@ pub(crate) fn regions(
             let fit = fit(rules, &[l])?;
             let grid = threadgroup_grid(groups, nominal)?;
             if empty(groups) {
-                return Ok(planned(Vec::new(), grid, false));
+                return Ok(planned(Vec::new(), grid, Fit::Planned));
             }
             let pieces = std::array::from_fn(|i| {
                 let mut p = Vec::new();
                 chunks(&mut p, 0, groups[i], l[i], rules.max_count[i]);
                 p
             });
-            Ok(planned(
-                product(pieces, tile_sized)?,
-                grid,
-                fit == Fit::EmulatedSimdgroups,
-            ))
+            Ok(planned(product(pieces, tile_sized)?, grid, fit))
         }
         Dispatch::ThreadgroupRange {
             groups,
@@ -555,7 +607,7 @@ pub(crate) fn regions(
             let end: [u32; 3] =
                 std::array::from_fn(|i| first[i].saturating_add(count[i]).min(groups[i]));
             if (0..3).any(|i| end[i] <= start[i]) {
-                return Ok(planned(Vec::new(), grid, false));
+                return Ok(planned(Vec::new(), grid, Fit::Planned));
             }
             let pieces = std::array::from_fn(|i| {
                 let mut p = Vec::new();
@@ -569,15 +621,11 @@ pub(crate) fn regions(
                 p
             });
             // Every region takes its first threadgroup from the push field.
-            Ok(planned(
-                product(pieces, true)?,
-                grid,
-                fit == Fit::EmulatedSimdgroups,
-            ))
+            Ok(planned(product(pieces, true)?, grid, fit))
         }
         Dispatch::Threads { threads, .. } => {
             if empty(threads) {
-                return Ok(planned(Vec::new(), threads, false));
+                return Ok(planned(Vec::new(), threads, Fit::Planned));
             }
             // A flat variant runs the whole grid in one region of the dispatch's own threadgroup
             // size: invocation `((wz · ny + wy) · nx + wx) · N + LocalInvocationIndex`, with
@@ -604,11 +652,7 @@ pub(crate) fn regions(
                     // region record whatever this says.
                     multi: false,
                 };
-                return Ok(planned(
-                    vec![region],
-                    threads,
-                    fit == Fit::EmulatedSimdgroups,
-                ));
+                return Ok(planned(vec![region], threads, fit));
             }
             let mut edges = false;
             let pieces: [Vec<Piece>; 3] = std::array::from_fn(|i| {
@@ -624,7 +668,7 @@ pub(crate) fn regions(
             let out = product(pieces, edges)?;
             let locals: Vec<[u32; 3]> = out.iter().map(|r| r.local).collect();
             let fit = fit(rules, &locals)?;
-            Ok(planned(out, threads, fit == Fit::EmulatedSimdgroups))
+            Ok(planned(out, threads, fit))
         }
         Dispatch::ThreadgroupsIndirect { .. } => {
             let fit = fit(rules, &[l])?;
@@ -634,11 +678,7 @@ pub(crate) fn regions(
                 base: [0; 3],
                 multi: false,
             };
-            Ok(planned(
-                vec![region],
-                [0; 3],
-                fit == Fit::EmulatedSimdgroups,
-            ))
+            Ok(planned(vec![region], [0; 3], fit))
         }
     }
 }
@@ -697,9 +737,9 @@ impl BindingPlan {
             (true, _) => return Err(not_implemented(Feature::GpuEncodedIndirectCommands)),
         };
         let mut planned = regions(&t.local, dispatch, flat)?;
-        if planned.emulated {
+        if planned.emulated || planned.flat_local {
             return Err(BindError::NeedsVariant {
-                variant: Box::new(self.emulated_variant()),
+                variant: Box::new(self.variant_for(&planned)),
             });
         }
         // A folded variant's region reads its record.
@@ -738,9 +778,9 @@ impl BindingPlan {
             threads_per_group,
         };
         let mut planned = regions(&t.local, &dispatch, self.variant.flat_grid)?;
-        if planned.emulated {
+        if planned.emulated || planned.flat_local {
             return Err(BindError::NeedsVariant {
-                variant: Box::new(self.emulated_variant()),
+                variant: Box::new(self.variant_for(&planned)),
             });
         }
         // Every region record states the dispatch's region.
@@ -763,19 +803,16 @@ impl BindingPlan {
     /// only the variant's compile knows.
     pub fn dispatch_variant(&self, dispatch: &Dispatch) -> Result<VariantKey, BindError> {
         let t = self.compute_template("dispatch_variant")?;
-        Ok(
-            if regions(&t.local, dispatch, self.variant.flat_grid)?.emulated {
-                self.emulated_variant()
-            } else {
-                self.variant.clone()
-            },
-        )
+        let planned = regions(&t.local, dispatch, self.variant.flat_grid)?;
+        Ok(self.variant_for(&planned))
     }
 
-    /// The plan's variant with emulated simdgroups.
-    fn emulated_variant(&self) -> VariantKey {
+    /// The plan's variant, with emulated simdgroups and a flat local size where `planned` has a
+    /// region that runs only on them.
+    fn variant_for(&self, planned: &Planned) -> VariantKey {
         let mut v = self.variant.clone();
-        v.emulated_simdgroups = true;
+        v.emulated_simdgroups |= planned.emulated;
+        v.flat_local |= planned.flat_local;
         v
     }
 

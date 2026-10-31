@@ -83,6 +83,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::AmplificationCount => Mechanism::Specialization,
         // A separate compile of the kernel, which a dispatch with a partial simdgroup asks for.
         RuntimeFact::EmulatedSimdgroups => Mechanism::Variant,
+        // A separate compile of the kernel, which a dispatch past a per-axis limit asks for.
+        RuntimeFact::FlatLocal => Mechanism::Variant,
         // The imageblock's extent sizes its Workgroup region; the planner checks the total.
         RuntimeFact::ImageblockSize { .. } => Mechanism::Specialization,
         // A separate compile of the vertex function, which a pass of one layer asks for.

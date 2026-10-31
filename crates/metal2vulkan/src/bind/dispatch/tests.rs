@@ -358,10 +358,10 @@ fn local_sizes_are_checked_against_every_d4_limit() {
         fit(&r, &[[60, 1, 1]]).expect("the subgroup limit is the flattened tier's"),
         Fit::EmulatedSimdgroups
     );
-    let e = fit(&r, &[[1, 1, 65]]).expect_err("z of a partial region");
-    assert!(
-        matches!(&e, BindError::Unsupported(u) if u.feature == Feature::LocalSize { axis: Some(Axis::Z) }),
-        "{e:?}"
+    // Past the variant's z, the region runs on its flat-local form too.
+    assert_eq!(
+        fit(&r, &[[1, 1, 65]]).expect("z of a partial region"),
+        Fit::EmulatedFlatLocal
     );
     let e = fit(&r, &[[33, 33, 1]]).expect_err("invocations of a partial region");
     assert!(
@@ -370,11 +370,11 @@ fn local_sizes_are_checked_against_every_d4_limit() {
     );
     // The whole dispatch runs on the variant, so every region of a dispatch with a partial one
     // is checked against the variant's limits, its whole-subgroup regions included: the z of
-    // [1, 1, 96] is past them, and [1, 1, 64], past the flattened tier's subgroups, is not.
-    let e = fit(&r, &[[1, 1, 96], [1, 1, 4]]).expect_err("z of a whole region");
-    assert!(
-        matches!(&e, BindError::Unsupported(u) if u.feature == Feature::LocalSize { axis: Some(Axis::Z) }),
-        "{e:?}"
+    // [1, 1, 96] is past them, so the dispatch runs on the variant's flat-local form, and
+    // [1, 1, 64], past the flattened tier's subgroups, is not.
+    assert_eq!(
+        fit(&r, &[[1, 1, 96], [1, 1, 4]]).expect("z of a whole region"),
+        Fit::EmulatedFlatLocal
     );
     assert!(
         fit(&r, &[[1, 1, 64]]).is_err(),
@@ -422,6 +422,74 @@ fn local_sizes_are_checked_against_every_d4_limit() {
 }
 
 /// A flattened (Direct) kernel's template: `sn` in one spec constant, whole 32-lane subgroups.
+/// A threadgroup past an axis's `maxComputeWorkGroupSize` whose threads fit
+/// `maxComputeWorkGroupInvocations` runs on the flat-local variant outside the flattened tiers,
+/// and on its plan, whose workgroup is flattened, as planned; one that does not fit it, or a
+/// derivative group's or a tile function's, keeps its own refusal.
+#[test]
+fn a_threadgroup_past_an_axis_limit_asks_for_the_flat_local_variant() {
+    let r = rules();
+    assert_eq!(fit(&r, &[[1, 1, 64]]).expect("64 deep"), Fit::Planned);
+    for l in [[1, 1, 128], [2, 4, 128], [1, 1, 1024], [4, 2, 100]] {
+        assert_eq!(fit(&r, &[l]).expect("flattened"), Fit::FlatLocal, "{l:?}");
+    }
+    assert_eq!(
+        fit(&r, &[[1, 1, 72], [2, 4, 128]]).expect("edge regions"),
+        Fit::FlatLocal
+    );
+    let e = fit(&r, &[[1, 1, 2048]]).expect_err("past the invocations");
+    assert!(
+        matches!(&e, BindError::Unsupported(u) if u.feature == Feature::LocalSize { axis: Some(Axis::Z) }),
+        "{e:?}"
+    );
+    let e = fit(&r, &[[33, 33, 1]]).expect_err("past the invocations, within each axis");
+    assert!(
+        matches!(&e, BindError::Unsupported(u) if u.feature == Feature::LocalSize { axis: None }),
+        "{e:?}"
+    );
+    let mut quads = rules();
+    quads.multiples = vec![4];
+    assert!(fit(&quads, &[[2, 2, 128]]).is_err(), "a derivative group");
+    let mut tile = rules();
+    tile.tile = true;
+    assert!(fit(&tile, &[[1, 1, 128]]).is_err(), "a tile function");
+    // The variant's own plan runs it as planned.
+    assert_eq!(
+        fit(&flat_rules(&r), &[[2, 4, 128]]).expect("on the variant"),
+        Fit::Planned
+    );
+
+    let t = template();
+    let mut base = VariantKey::new();
+    base.psb_slots.insert(kslot(3));
+    let plan = compute_plan(&t, base.clone());
+    let mut flat = base.clone();
+    flat.flat_local = true;
+    let tall = [
+        groups([1, 1, 128]),
+        groups([2, 4, 128]),
+        Dispatch::Threads {
+            threads: [3, 5, 200],
+            threads_per_group: [2, 4, 128],
+        },
+        Dispatch::ThreadgroupsIndirect {
+            indirect: IndirectRef::new(0, 0),
+            threads_per_group: [1, 1, 100],
+        },
+    ];
+    for d in &tall {
+        assert_eq!(plan.dispatch_variant(d), Ok(flat.clone()), "{d:?}");
+        assert_eq!(
+            plan.instantiate_dispatch(&state(0), d),
+            Err(BindError::NeedsVariant {
+                variant: Box::new(flat.clone())
+            }),
+            "{d:?}"
+        );
+    }
+    assert_eq!(plan.dispatch_variant(&groups([8, 8, 16])), Ok(base.clone()));
+}
+
 fn flat_template() -> ComputeTemplate {
     let mut t = template();
     t.spec.push(spec(4, SpecKey::FlatLocalSize));
@@ -505,23 +573,27 @@ fn a_partial_simdgroup_asks_for_the_emulated_simdgroups_variant() {
     ));
     // A `dispatchThreads` grid whose edge is partial runs whole on the variant, so its interior
     // is checked against the variant's per-axis limits (z at most 64 here), not the flattened
-    // `sn`: the answer is a refusal, not a variant whose plan refuses the interior.
+    // `sn`: past them, the variant's flat-local form runs it, which the flattened plan and the
+    // variant's both ask for.
     let mixed = |tpg_z| Dispatch::Threads {
         threads: [1, 1, 100],
         threads_per_group: [1, 1, tpg_z],
     };
     let variant = compute_plan(&template(), emulated.clone());
+    let mut flat = emulated.clone();
+    flat.flat_local = true;
+    assert_eq!(plan.dispatch_variant(&mixed(96)), Ok(flat.clone()));
     for r in [
-        plan.dispatch_variant(&mixed(96)).map(|_| ()),
         plan.instantiate_dispatch(&state(0), &mixed(96)).map(|_| ()),
         variant
             .instantiate_dispatch(&state(0), &mixed(96))
             .map(|_| ()),
     ] {
-        let e = r.expect_err("z of the interior");
-        assert!(
-            matches!(&e, BindError::Unsupported(u) if u.feature == Feature::LocalSize { axis: Some(Axis::Z) }),
-            "{e:?}"
+        assert_eq!(
+            r,
+            Err(BindError::NeedsVariant {
+                variant: Box::new(flat.clone())
+            })
         );
     }
     assert_eq!(plan.dispatch_variant(&mixed(64)), Ok(emulated.clone()));

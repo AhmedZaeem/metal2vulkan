@@ -827,6 +827,11 @@ fn plan(p: &ComputePipeline, device: &Device, shape: &BindShape) -> Result<Bindi
         .dependencies
         .iter()
         .any(|d| d.fact == RuntimeFact::EmulatedSimdgroups);
+    // And one compiled for a flat local size (`dispatch_variant`).
+    variant.flat_local = p
+        .dependencies
+        .iter()
+        .any(|d| d.fact == RuntimeFact::FlatLocal);
     // A pipeline compiled for a flat grid states its variant.
     variant.flat_grid = p
         .dependencies

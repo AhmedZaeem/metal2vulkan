@@ -83,6 +83,12 @@ pub enum RuntimeFact {
     /// emulated tier whatever tier the profile's subgroups give them, so every threadgroup size
     /// runs, partial simdgroups included. Its plans state the variant.
     EmulatedSimdgroups,
+    /// The kernel was compiled under `VariantKey::flat_local`: its Vulkan workgroup is
+    /// `(sx·sy·sz, 1, 1)` and every position builtin derives from `LocalInvocationIndex`
+    /// (`lower::dispatch::LocalSizeForm::FlatIndex`), so a threadgroup whose size passes the
+    /// device's `maxComputeWorkGroupSize` on an axis, but not its invocations, runs. Its plans
+    /// state the variant.
+    FlatLocal,
     /// The compute encoder's imageblock size (`setImageblockWidth:height:`,
     /// `SpecKey::ImageblockWidth` and `SpecKey::ImageblockHeight`): the kernel's explicit
     /// imageblock takes `cell_bytes` of the threadgroup's Workgroup memory per pixel, after its

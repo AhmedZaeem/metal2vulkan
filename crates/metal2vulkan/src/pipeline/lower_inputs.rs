@@ -39,6 +39,13 @@ pub struct LoweringInputs {
     /// kernel has simdgroups this emulates; a vertex or fragment function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_simdgroups: bool,
+    /// A kernel's Vulkan workgroup is flattened to `(sx·sy·sz, 1, 1)` whatever its tier
+    /// (`VariantKey::flat_local`): the variant a dispatch runs on whose threadgroup passes the
+    /// device's `maxComputeWorkGroupSize` on an axis while its threads fit
+    /// `maxComputeWorkGroupInvocations`. A kernel compiled under it depends on
+    /// `RuntimeFact::FlatLocal`. Any other function compiles as without it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub flat_local: bool,
     /// A vertex function does not write its `[[render_target_array_index]]` output
     /// (`VariantKey::dropped_vertex_layer`): the variant a pass of at most one layer runs on, where
     /// every index renders slice 0. A vertex function that writes the output depends on

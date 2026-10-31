@@ -7,7 +7,12 @@
 //! ([`LocalSizeForm::Spec`]); in the flattened tiers (`Direct`, `Cluster32`) it is `(sn, 1, 1)`
 //! with `sn = sx·sy·sz` a specialization constant the planner writes (`SpecKey::FlatLocalSize`,
 //! [`LocalSizeForm::Flat`]), so no `OpSpecConstantOp` is placed in `WorkgroupSize` and no
-//! `maintenance4` is needed. An object function's constants are keys of its own
+//! `maintenance4` is needed. Under the flat-local variant (`LoweringInputs::flat_local`) a kernel
+//! of the other tiers takes `(sn, 1, 1)` too, its linear index `LocalInvocationIndex`
+//! ([`LocalSizeForm::FlatIndex`]): the variant a dispatch runs on whose threadgroup passes the
+//! device's `maxComputeWorkGroupSize` on an axis, which Metal's any shape of up to 1024 threads
+//! may. A kernel with compute derivatives refuses it. An object function's constants are keys of
+//! its own
 //! (`SpecKey::ObjectLocalSize`, `ObjectFlatLocalSize` and `ObjectMultiRegion`,
 //! [`DispatchPlan::keys`]): link gives a key one id over the pipeline, and a mesh render pipeline's
 //! object and mesh threadgroups take separate sizes.
@@ -104,7 +109,7 @@ use crate::lower::arith;
 use crate::lower::emit::EmitCx;
 use crate::lower::select::{Plan, SelectCx};
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::sym::{DispatchKeys, PushField, SpecKey};
+use crate::pipeline::sym::{DispatchKeys, PushField, SpecKey, Stage};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
@@ -364,8 +369,20 @@ pub enum LocalSizeForm {
     /// `WorkgroupSize = (sx, sy, sz)`, each a `SpecKey::LocalSize` specialization constant.
     Spec,
     /// `WorkgroupSize = (sn, 1, 1)`, `sn = sx·sy·sz` the `SpecKey::FlatLocalSize` constant: the
-    /// flattened Direct and Cluster32 tiers.
+    /// flattened Direct and Cluster32 tiers, whose linear index counts their subgroups.
     Flat,
+    /// `WorkgroupSize = (sn, 1, 1)` as [`Flat`](Self::Flat), with the linear index
+    /// `LocalInvocationIndex`: a kernel of any other tier under `LoweringInputs::flat_local`, the
+    /// variant a threadgroup past the device's `maxComputeWorkGroupSize` on an axis runs on.
+    FlatIndex,
+}
+
+impl LocalSizeForm {
+    /// The Vulkan workgroup is `(sn, 1, 1)`, and the position in the threadgroup is the linear
+    /// index unflattened over `(sx, sy, sz)`.
+    pub fn flattened(self) -> bool {
+        matches!(self, Self::Flat | Self::FlatIndex)
+    }
 }
 
 /// The dispatch plan of a kernel.
@@ -477,12 +494,25 @@ fn reads_region(b: KernelBuiltin, tile_sized: bool) -> bool {
 /// derivatives is refused in the flattened tiers (`ComputeDerivativesWithSimd`): flattening
 /// destroys the 2D quad shape.
 pub fn plan_kernel(cx: &mut SelectCx<'_>, tier: Tier) -> Result<DispatchPlan, Error> {
+    // A kernel's other tiers flatten under the flat-local variant, which a tile function never
+    // takes: its threads take the tile's layout.
+    let flat_local = cx.inputs.flat_local
+        && cx.stage == Stage::Kernel
+        && !crate::lower::access::tile::is_tile(cx);
     let local_size = match tier {
         Tier::Direct | Tier::Cluster32 => LocalSizeForm::Flat,
+        _ if flat_local => LocalSizeForm::FlatIndex,
         _ => LocalSizeForm::Spec,
     };
     if local_size == LocalSizeForm::Flat && cx.families.barrier.compute_derivatives {
         return Err(Unsupported::not_representable(Feature::ComputeDerivativesWithSimd).into());
+    }
+    // A derivative group is a 2D shape, which flattening destroys.
+    if local_size == LocalSizeForm::FlatIndex && cx.families.barrier.compute_derivatives {
+        return Err(Unsupported::not_representable(Feature::ComputeDerivatives).into());
+    }
+    if flat_local {
+        cx.facts.insert(RuntimeFact::FlatLocal);
     }
     let used = used_params(cx);
     let mut builtins = BuiltinSet::default();
@@ -849,7 +879,7 @@ impl Needs {
         ]
         .into_iter()
         .any(has)
-            || (local_pos && (dp.local_size == LocalSizeForm::Flat || dp.tile));
+            || (local_pos && (dp.local_size.flattened() || dp.tile));
         Needs {
             lin,
             local_pos,
@@ -919,7 +949,7 @@ impl KernelDecl {
             LocalSizeForm::Spec => {
                 mb.workgroup_size(size[0], size[1], size[2])?;
             }
-            LocalSizeForm::Flat => {
+            LocalSizeForm::Flat | LocalSizeForm::FlatIndex => {
                 let n = u64::from(dx) * u64::from(dy) * u64::from(dz);
                 let sn = mb.spec(keys.flat, u32_, ConstBits(n))?;
                 let one = mb.constant(Constant::Scalar {
@@ -983,7 +1013,7 @@ impl KernelDecl {
             size,
             multi_region,
             local_id: var(
-                needs.local_pos && !flat && !dp.tile,
+                needs.local_pos && !dp.local_size.flattened() && !dp.tile,
                 B::LocalInvocationId,
                 uvec3,
             )?,
@@ -1072,7 +1102,7 @@ impl KernelDecl {
     /// The linear local index `lin`.
     fn lin(&self, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
         match self.form {
-            LocalSizeForm::Spec => self.load(fb, self.local_index),
+            LocalSizeForm::Spec | LocalSizeForm::FlatIndex => self.load(fb, self.local_index),
             LocalSizeForm::Flat => {
                 let sg = self.load(fb, self.subgroup_id)?;
                 let size = self.load(fb, self.subgroup_size)?;
@@ -1092,7 +1122,7 @@ impl KernelDecl {
         }
         match self.form {
             LocalSizeForm::Spec => self.load(fb, self.local_id),
-            LocalSizeForm::Flat => {
+            LocalSizeForm::Flat | LocalSizeForm::FlatIndex => {
                 let lin = self.lin(fb)?;
                 let sx = fb.module().const_value(self.size[0])?;
                 let sy = fb.module().const_value(self.size[1])?;

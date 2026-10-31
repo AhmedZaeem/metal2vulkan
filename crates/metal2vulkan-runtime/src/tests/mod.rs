@@ -279,6 +279,8 @@ mod submit_stalls_idle;
 mod surface_depth;
 mod surface_two_planes;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod tall_threadgroups;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod teardown_threads;
 mod texture;
 mod texture_descriptor;

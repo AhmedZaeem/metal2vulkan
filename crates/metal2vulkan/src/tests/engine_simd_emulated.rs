@@ -1958,18 +1958,16 @@ fn a_mixed_dispatch_is_checked_against_the_variants_limits() {
     };
     assert_eq!(plan.dispatch_variant(&interior), Ok(VariantKey::new()));
     assert!(plan.instantiate_dispatch(&state, &interior).is_ok());
+    // Past the variant's z, its flat-local form runs the mixed dispatch, which both plans ask for.
+    let mut flat = emulated_key();
+    flat.flat_local = true;
+    assert_eq!(plan.dispatch_variant(&mixed(96)), Ok(flat.clone()));
     for r in [
-        plan.dispatch_variant(&mixed(96)).map(drop),
         plan.instantiate_dispatch(&state, &mixed(96)).map(drop),
         vplan.instantiate_dispatch(&state, &mixed(96)).map(drop),
     ] {
         match r {
-            Err(BindError::Unsupported(u)) => assert_eq!(
-                u.feature,
-                Feature::LocalSize {
-                    axis: Some(Axis::Z)
-                }
-            ),
+            Err(BindError::NeedsVariant { variant }) => assert_eq!(*variant, flat),
             other => panic!("{other:?}"),
         }
     }

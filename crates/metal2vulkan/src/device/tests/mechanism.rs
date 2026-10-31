@@ -53,6 +53,7 @@ fn every_fact() -> Vec<RuntimeFact> {
         },
         RuntimeFact::AmplificationCount,
         RuntimeFact::EmulatedSimdgroups,
+        RuntimeFact::FlatLocal,
         RuntimeFact::ImageblockSize { cell_bytes: 16 },
         RuntimeFact::RenderTargetArrayLength {
             layer_dropped: false,
@@ -290,6 +291,7 @@ fn variant(f: &RuntimeFact) -> usize {
         RuntimeFact::SimdgroupEmulation { .. } => 21,
         RuntimeFact::AmplificationCount => 22,
         RuntimeFact::EmulatedSimdgroups => 23,
+        RuntimeFact::FlatLocal => 89,
         RuntimeFact::ImageblockSize { .. } => 24,
         RuntimeFact::RenderTargetArrayLength { .. } => 25,
         RuntimeFact::StageInRegion => 26,
@@ -362,7 +364,7 @@ fn variant(f: &RuntimeFact) -> usize {
 fn mechanism_is_total_over_every_fact_and_profile() {
     let facts = every_fact();
     let covered: std::collections::BTreeSet<usize> = facts.iter().map(variant).collect();
-    assert_eq!(covered, (0..89).collect(), "every_fact misses a variant");
+    assert_eq!(covered, (0..90).collect(), "every_fact misses a variant");
     for (stem, _) in super::committed_profiles() {
         let dev = device(&stem);
         let p = dev.profile();
@@ -423,6 +425,7 @@ fn mechanism_is_total_over_every_fact_and_profile() {
                 RuntimeFact::StorageTextureFormat { .. }
                 | RuntimeFact::StorageTextureNumericType { .. }
                 | RuntimeFact::EmulatedSimdgroups
+                | RuntimeFact::FlatLocal
                 | RuntimeFact::RenderTargetArrayLength { .. }
                 | RuntimeFact::UniformViewRange { .. }
                 | RuntimeFact::SrgbTexture { .. }

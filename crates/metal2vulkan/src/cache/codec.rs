@@ -1266,6 +1266,7 @@ codec_enum! {
         QuadPrimitiveIds,
         PrivateList,
         YCbCrInPlace { slot, samplers, device },
+        FlatLocal,
     }
     UniformViewChoice { Viewed, Spare, Kept }
     Mechanism {

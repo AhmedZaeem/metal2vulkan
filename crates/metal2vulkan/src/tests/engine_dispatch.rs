@@ -890,3 +890,107 @@ done:
     }
     assert_eq!(words, want);
 }
+
+/// The flat-local variant (`LoweringInputs::flat_local`) of a kernel outside the flattened tiers
+/// flattens its workgroup to `(x·y·z, 1, 1)` (`LocalSizeForm::FlatIndex`), depends on
+/// `RuntimeFact::FlatLocal`, and answers every kernel builtin as Metal does from
+/// `LocalInvocationIndex`: the owned fixture `gsm_global_builtins.ll` stores 29 words a thread,
+/// run here on threadgroups 128 deep (past an NVIDIA GPU's 64) and of other shapes.
+#[test]
+fn the_flat_local_variant_answers_every_builtin_as_metal() {
+    let bc = match llvm_assemble(&engine_dir().join("gsm_global_builtins.ll")) {
+        Ok(b) => b,
+        Err(AssembleError::Missing(why)) => {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+        Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected the fixture: {why}"),
+    };
+    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let mut inputs = crate::lower::select::LowerInputs::new();
+    inputs.flat_local = true;
+    let entry = "global_builtins_in_a_kernel";
+    let (plan, m) = crate::pipeline::testing::typed_module_with(&bc, entry, &p, &inputs)
+        .unwrap_or_else(|e| panic!("{entry}: {e}"));
+    assert_eq!(
+        plan.dispatch.as_ref().map(|d| d.local_size),
+        Some(LocalSizeForm::FlatIndex)
+    );
+    assert!(plan.facts.contains(&RuntimeFact::FlatLocal));
+    // Without the input the kernel keeps its own form.
+    let (own, _) = typed_module(&bc, entry, &p).expect("own");
+    assert_eq!(
+        own.dispatch.as_ref().map(|d| d.local_size),
+        Some(LocalSizeForm::Spec)
+    );
+    assert!(!own.facts.contains(&RuntimeFact::FlatLocal));
+    for (local, groups) in [
+        ([2, 4, 8], [2, 1, 1]),
+        ([1, 1, 128], [1, 1, 2]),
+        ([1, 2, 96], [1, 2, 1]),
+    ] {
+        let mut spec = BTreeMap::new();
+        for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
+            spec.insert(SpecKey::LocalSize(a), u64::from(v));
+        }
+        let n: u32 = local.iter().product();
+        spec.insert(SpecKey::FlatLocalSize, u64::from(n));
+        let grid = [0, 1, 2].map(|i| local[i] * groups[i]);
+        let threads = (grid[0] * grid[1] * grid[2]) as usize;
+        let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
+        let res = Resources {
+            buffers: vec![Buffer {
+                slot: Some(ResourceSlot {
+                    stage: Stage::Kernel,
+                    kind: ResourceKind::Buffer,
+                    index: 0,
+                }),
+                address: None,
+                bytes: vec![0; threads * 29 * 4],
+            }],
+            push,
+            spec,
+        };
+        let cfg = Config {
+            workgroups: groups,
+            subgroup: SubgroupSize::W32,
+            order: Order::Forward,
+            ..Config::default()
+        };
+        let out = run(&m, &cfg, res).expect("run");
+        let words: Vec<u32> = out.buffers[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        let mut t = 0;
+        for z in 0..grid[2] {
+            for y in 0..grid[1] {
+                for x in 0..grid[0] {
+                    let pos = [x, y, z];
+                    let g = [0, 1, 2].map(|i| pos[i] / local[i]);
+                    let l = [0, 1, 2].map(|i| pos[i] % local[i]);
+                    let index = l[0] + local[0] * (l[1] + local[1] * l[2]);
+                    let mut want = Vec::new();
+                    want.extend(local);
+                    want.extend(l);
+                    want.extend([index, index % 32, index / 32, n.div_ceil(32)]);
+                    want.extend([index % 4, index / 4, n.div_ceil(4)]);
+                    want.extend(pos);
+                    want.extend(g);
+                    want.extend(grid);
+                    want.extend(groups);
+                    want.extend(local);
+                    want.push(n.div_ceil(32));
+                    assert_eq!(
+                        &words[t * 29..t * 29 + 29],
+                        &want[..],
+                        "{local:?} thread {pos:?}"
+                    );
+                    t += 1;
+                }
+            }
+        }
+    }
+}
