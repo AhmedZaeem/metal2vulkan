@@ -171,15 +171,15 @@ impl Registry {
 
     /// The reaper's sweep: whether to sweep it again, where it holds any home.
     fn sweep_reaped(&self) -> bool {
-        let mut gone = Vec::new();
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
         let mut homes = lock(&self.homes);
-        self.swept(&mut homes, &mut gone);
+        self.swept(&mut homes, (&mut gone, &mut kept));
         let again = !homes.is_empty();
         if !again {
             self.reaped.store(false, Ordering::Relaxed);
         }
         drop(homes);
-        drop(gone);
+        drop((gone, kept));
         again
     }
 }
@@ -229,10 +229,15 @@ pub(crate) fn process_homes() -> [u64; 3] {
 
 /// A registry's entry as the afterlife's rules see it ([`sweep`]).
 trait Lived {
+    /// What a look at its pages takes hold of, which the caller drops once it let go of the
+    /// registry's lock: a buffer's last handle going under it would free the buffer's import,
+    /// whose going sweeps the registry ([`Registry::pages_gone`]), and run its deallocator.
+    type Kept;
     /// Whether a texture holds it.
     fn held(&self) -> bool;
-    /// Whether its bytes lie where it was made: its buffer lives, not rebound since.
-    fn pages(&self) -> bool;
+    /// Whether its bytes lie where it was made: its buffer lives, not rebound since; what it
+    /// took hold of to tell into `kept`.
+    fn pages(&self, kept: &mut Vec<Self::Kept>) -> bool;
     /// Its image's bytes.
     fn bytes(&self) -> u64;
     fn orphaned(&self) -> Option<u64>;
@@ -260,14 +265,14 @@ struct Swept {
 fn sweep<L: Lived>(
     entries: &mut Vec<L>,
     now: u64,
-    gone: &mut Vec<L>,
+    (gone, kept): (&mut Vec<L>, &mut Vec<L::Kept>),
     (budget, most): (u64, usize),
 ) -> Swept {
     let mut swept = Swept::default();
     let mut at = 0;
     while at < entries.len() {
         let entry = &mut entries[at];
-        let goes = if !entry.pages() {
+        let goes = if !entry.pages(kept) {
             swept.dropped += 1;
             true
         } else if entry.held() {
@@ -327,12 +332,14 @@ fn revive<L: Lived>(entry: &mut L) -> bool {
 }
 
 impl Lived for Home {
+    type Kept = crate::Buffer;
+
     fn held(&self) -> bool {
         self.texels.strong_count() > 0
     }
 
-    fn pages(&self) -> bool {
-        shadow_bytes(&self.copies).is_some_and(|(raw, _)| raw == self.raw)
+    fn pages(&self, kept: &mut Vec<crate::Buffer>) -> bool {
+        shadow_bytes_kept(&self.copies, kept).is_some_and(|(raw, _)| raw == self.raw)
     }
 
     fn bytes(&self) -> u64 {
@@ -358,41 +365,51 @@ impl Registry {
     /// (`dirty_pages.rs`'s `Sibling`), which its submission checks again.
     fn sibling(&self, copies: &Arc<ShadowCopies>, host: u64) -> Option<Sibling> {
         let (_, mine) = shadow_bytes(copies)?;
-        let mut gone = Vec::new();
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
         let mut homes = lock(&self.homes);
         if self.due() {
-            self.swept(&mut homes, &mut gone);
+            self.swept(&mut homes, (&mut gone, &mut kept));
         }
         let sibling = homes.iter().find_map(|home| {
             if home.host.as_ref().map(|bytes| bytes.start) != Some(host) {
                 return None;
             }
             let theirs = &home.copies;
-            if Arc::ptr_eq(theirs, copies) || theirs.tracked != copies.tracked || !home.pages() {
+            if Arc::ptr_eq(theirs, copies) || theirs.tracked != copies.tracked {
                 return None;
             }
-            if shadow_bytes(theirs)?.1 != mine {
+            if !home.pages(&mut kept) || shadow_bytes_kept(theirs, &mut kept)?.1 != mine {
                 return None;
             }
-            let keep: Arc<dyn Send + Sync> = Arc::<Image>::clone(&home.image);
+            // Its buffer too: a copy in's submission reads it again under the scheduler's lock
+            // (`dirty_pages.rs`), where its last handle going would run its deallocator.
+            let buffer = kept.last().cloned();
+            let keep: Arc<dyn Send + Sync> = Arc::new((Arc::<Image>::clone(&home.image), buffer));
             Some(Sibling {
                 copies: Arc::clone(theirs),
                 _keep: keep,
             })
         });
         drop(homes);
-        drop(gone);
+        drop((gone, kept));
         sibling
     }
 
     /// Sweep the registry now (its import went, or a rebind moved a buffer's bytes): the homes
     /// whose pages went go at once.
     fn pages_gone(&self) {
-        let mut gone = Vec::new();
-        let mut homes = lock(&self.homes);
-        self.swept(&mut homes, &mut gone);
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
+        // An import's going under a sweep of this registry (its buffer's last handle let go of
+        // there) finds the lock held, by its own thread or another: that sweep, or the next,
+        // drops the homes whose pages went, and a home is checked as it is taken.
+        let mut homes = match self.homes.try_lock() {
+            Ok(homes) => homes,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        self.swept(&mut homes, (&mut gone, &mut kept));
         drop(homes);
-        drop(gone);
+        drop((gone, kept));
     }
 
     /// The tally ([`AfterlifeTally`]): made, taken, and afterlives kept, taken, expired,
@@ -406,14 +423,18 @@ impl Registry {
     }
 
     /// [`sweep`] `homes`, under their lock, into `gone`, counted, and the census's line a second.
-    fn swept(&self, homes: &mut Vec<Home>, gone: &mut Vec<Home>) {
+    fn swept(
+        &self,
+        homes: &mut Vec<Home>,
+        (gone, kept): (&mut Vec<Home>, &mut Vec<crate::Buffer>),
+    ) {
         let now = crate::gpu_time::host_nanos();
         self.swept_at.store(now, Ordering::Relaxed);
         let mut share = lock(&self.share);
         // The process's budget, less what the other registries keep.
         let others = KEPT_BYTES.load(Ordering::Relaxed).saturating_sub(share[0]);
         let budget = AFTERLIFE_BYTES.saturating_sub(others);
-        let swept = sweep(homes, now, gone, (budget, AFTERLIFE_HOMES));
+        let swept = sweep(homes, now, (gone, kept), (budget, AFTERLIFE_HOMES));
         let now_share = [swept.bytes, swept.held, swept.orphans];
         for ((count, old), new) in [&KEPT_BYTES, &HELD, &ORPHANED]
             .iter()
@@ -472,16 +493,18 @@ impl Registry {
     /// The storage of a live home of `key` whose image serves a texture planned as `plan`, marked
     /// shared; `None` where none does.
     fn take(&self, key: HomeKey, plan: &ImagePlan, texels: &Arc<Texels>) -> Option<Storage> {
-        let mut gone = Vec::new();
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
         let mut homes = lock(&self.homes);
         if self.due() {
-            self.swept(&mut homes, &mut gone);
+            self.swept(&mut homes, (&mut gone, &mut kept));
         }
         if crate::dirty_pages::census_on() {
             miss_lines(&homes, key, plan, texels);
         }
         let taken = (homes.iter_mut())
-            .filter(|home| home.key == key && serves(home.image.plan(), plan) && home.pages())
+            .filter(|home| {
+                home.key == key && serves(home.image.plan(), plan) && home.pages(&mut kept)
+            })
             .map(|home| {
                 // A home in its afterlife takes the new texture's texels, laid out as its own
                 // over the same buffer (the key's).
@@ -500,7 +523,7 @@ impl Registry {
             })
             .next();
         drop(homes);
-        drop(gone);
+        drop((gone, kept));
         taken
     }
 
@@ -520,10 +543,10 @@ impl Registry {
         };
         let (_, _, [width, height, depth], texel) = layout;
         let bytes = u64::from(width) * u64::from(height) * u64::from(depth.max(1)) * texel;
-        let mut gone = Vec::new();
+        let (mut gone, mut kept) = (Vec::new(), Vec::new());
         let mut homes = lock(&self.homes);
         if self.due() || homes.len() >= HOMES {
-            self.swept(&mut homes, &mut gone);
+            self.swept(&mut homes, (&mut gone, &mut kept));
         }
         if homes.len() < HOMES {
             self.tally.made.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +563,7 @@ impl Registry {
         }
         let reaped = !homes.is_empty() && !self.reaped.swap(true, Ordering::Relaxed);
         drop(homes);
-        drop(gone);
+        drop((gone, kept));
         reaped
     }
 }
@@ -700,6 +723,22 @@ pub(crate) type ShadowLayout = ([u32; 6], [i32; 3], [u32; 3], u64);
 /// Where a shadow's texels lie now, for telling two shadows over the same host bytes apart: its
 /// `VkBuffer`, and their layout there; `None` where they lie in no one region of a `VkBuffer`,
 /// or nowhere (a buffer gone or detached).
+/// [`shadow_bytes`], the buffer it reads taken hold of into `kept`: for a caller under a lock,
+/// which drops `kept` once it let go of it ([`Lived::Kept`]).
+fn shadow_bytes_kept(
+    copies: &ShadowCopies,
+    kept: &mut Vec<crate::Buffer>,
+) -> Option<(ash::vk::Buffer, ShadowLayout)> {
+    if let ShadowSource::Bytes {
+        buffer: crate::shadow::ShadowBuffer::Rebound(buffer),
+        ..
+    } = &copies.source
+    {
+        kept.extend(buffer.upgrade());
+    }
+    shadow_bytes(copies)
+}
+
 pub(crate) fn shadow_bytes(copies: &ShadowCopies) -> Option<(ash::vk::Buffer, ShadowLayout)> {
     let ShadowSource::Bytes {
         buffer,
@@ -757,10 +796,11 @@ mod tests {
     }
 
     impl Lived for Entry {
+        type Kept = ();
         fn held(&self) -> bool {
             self.held
         }
-        fn pages(&self) -> bool {
+        fn pages(&self, _kept: &mut Vec<()>) -> bool {
             self.pages
         }
         fn bytes(&self) -> u64 {
@@ -787,7 +827,7 @@ mod tests {
     fn a_home_no_texture_holds_is_kept_until_it_expires() {
         let mut entries = vec![entry(false, 1 << 20), entry(true, 1 << 20)];
         let mut gone = Vec::new();
-        let first = sweep(&mut entries, 1_000, &mut gone, ALL);
+        let first = sweep(&mut entries, 1_000, (&mut gone, &mut Vec::new()), ALL);
         assert_eq!(
             first,
             Swept {
@@ -799,9 +839,19 @@ mod tests {
             }
         );
         assert_eq!(entries.len(), 2, "kept, its afterlife begun");
-        let within = sweep(&mut entries, 1_000 + AFTERLIFE_NANOS, &mut gone, ALL);
+        let within = sweep(
+            &mut entries,
+            1_000 + AFTERLIFE_NANOS,
+            (&mut gone, &mut Vec::new()),
+            ALL,
+        );
         assert_eq!(within.expired, 0, "within its afterlife");
-        let past = sweep(&mut entries, 1_001 + AFTERLIFE_NANOS, &mut gone, ALL);
+        let past = sweep(
+            &mut entries,
+            1_001 + AFTERLIFE_NANOS,
+            (&mut gone, &mut Vec::new()),
+            ALL,
+        );
         assert_eq!(past.expired, 1);
         assert_eq!(entries.len(), 1, "the held one stays");
         assert_eq!(gone.len(), 1);
@@ -811,11 +861,16 @@ mod tests {
     fn a_home_taken_again_leaves_its_afterlife() {
         let mut entries = vec![entry(false, 1 << 20)];
         let mut gone = Vec::new();
-        sweep(&mut entries, 1_000, &mut gone, ALL);
+        sweep(&mut entries, 1_000, (&mut gone, &mut Vec::new()), ALL);
         assert!(revive(&mut entries[0]), "taken out of its afterlife");
         entries[0].held = true;
         assert!(!revive(&mut entries[0]), "a held home is in none");
-        let later = sweep(&mut entries, 1_000 + 2 * AFTERLIFE_NANOS, &mut gone, ALL);
+        let later = sweep(
+            &mut entries,
+            1_000 + 2 * AFTERLIFE_NANOS,
+            (&mut gone, &mut Vec::new()),
+            ALL,
+        );
         let held = Swept {
             held: 1,
             ..Swept::default()
@@ -831,13 +886,23 @@ mod tests {
         let mut gone = Vec::new();
         for at in 1..=3 {
             entries.push(entry(false, third));
-            sweep(&mut entries, at, &mut gone, (AFTERLIFE_BYTES, usize::MAX));
+            sweep(
+                &mut entries,
+                at,
+                (&mut gone, &mut Vec::new()),
+                (AFTERLIFE_BYTES, usize::MAX),
+            );
         }
         let evicted: u64 = gone.len() as u64;
         assert_eq!(evicted, 1, "the third goes past the budget");
         assert_eq!(gone[0].orphaned, Some(1), "the longest kept");
         assert_eq!(entries.len(), 2);
-        let swept = sweep(&mut entries, 4, &mut gone, (AFTERLIFE_BYTES, usize::MAX));
+        let swept = sweep(
+            &mut entries,
+            4,
+            (&mut gone, &mut Vec::new()),
+            (AFTERLIFE_BYTES, usize::MAX),
+        );
         assert_eq!(swept.bytes, 2 * third);
     }
 
@@ -845,12 +910,17 @@ mod tests {
     fn a_registry_keeps_a_few_homes_and_a_share_of_the_process_s_bytes() {
         let mut entries: Vec<Entry> = (0..AFTERLIFE_HOMES + 3).map(|_| entry(false, 1)).collect();
         let mut gone = Vec::new();
-        let swept = sweep(&mut entries, 1_000, &mut gone, ALL);
+        let swept = sweep(&mut entries, 1_000, (&mut gone, &mut Vec::new()), ALL);
         assert_eq!(swept.evicted, 3, "past the count a registry keeps");
         assert_eq!(entries.len(), AFTERLIFE_HOMES);
         // Other registries keep all but 10 bytes of the process's budget.
         let mut entries: Vec<Entry> = (0..4).map(|_| entry(false, 4)).collect();
-        let swept = sweep(&mut entries, 1_000, &mut gone, (10, AFTERLIFE_HOMES));
+        let swept = sweep(
+            &mut entries,
+            1_000,
+            (&mut gone, &mut Vec::new()),
+            (10, AFTERLIFE_HOMES),
+        );
         assert_eq!(swept.bytes, 8, "within its share");
         assert_eq!(swept.evicted, 2);
     }
@@ -859,11 +929,22 @@ mod tests {
     fn a_home_whose_pages_went_goes_at_once() {
         let mut entries = vec![entry(true, 1 << 20), entry(false, 1 << 20)];
         let mut gone = Vec::new();
-        sweep(&mut entries, 1_000, &mut gone, ALL);
+        sweep(&mut entries, 1_000, (&mut gone, &mut Vec::new()), ALL);
         // A rebind moved the held one's bytes, and the kept one's buffer went.
         entries.iter_mut().for_each(|entry| entry.pages = false);
-        let swept = sweep(&mut entries, 1_001, &mut gone, ALL);
+        let swept = sweep(&mut entries, 1_001, (&mut gone, &mut Vec::new()), ALL);
         assert_eq!(swept.dropped, 2, "both, held or kept, at once");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn a_sweep_its_own_thread_asks_for_under_the_registry_s_lock_returns() {
+        // A buffer's last handle going under a sweep frees its import, whose going asks for a
+        // sweep of the same registry on the same thread.
+        let registry = super::Registry::default();
+        let held = registry.homes.lock().unwrap();
+        registry.pages_gone();
+        drop(held);
+        registry.pages_gone();
     }
 }
