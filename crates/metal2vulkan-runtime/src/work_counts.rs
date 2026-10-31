@@ -4435,6 +4435,27 @@ pub struct WorkCounts {
     pub home_afterlives_dropped: u64,
     /// The bytes of the images homes in their afterlife keep now.
     pub home_afterlife_bytes: u64,
+    /// The runtime's objects that hold device memory or the device, live now in the process
+    /// (`live.rs`): devices, buffers (the program's and the runtime's own), images, shadows and
+    /// their texels, command queues, command buffers, recorder logs and copy-in gates. What grows
+    /// over a steady load is what holds memory past its use.
+    pub live_devices: u64,
+    /// See `live_devices`.
+    pub live_buffers: u64,
+    /// See `live_devices`.
+    pub live_images: u64,
+    /// See `live_devices`.
+    pub live_shadows: u64,
+    /// See `live_devices`.
+    pub live_texels: u64,
+    /// See `live_devices`.
+    pub live_queues: u64,
+    /// See `live_devices`.
+    pub live_command_buffers: u64,
+    /// See `live_devices`.
+    pub live_recorder_logs: u64,
+    /// See `live_devices`.
+    pub live_copy_in_gates: u64,
     /// Of `host_textures_in_place`, those over pages imported as dma-bufs: each a
     /// `DRM_FORMAT_MOD_LINEAR` image over a dma-buf of its own pages (also counted in
     /// `dma_buf_images`).
@@ -5488,6 +5509,15 @@ impl Device {
             home_afterlives_evicted: homes[4],
             home_afterlives_dropped: homes[5],
             home_afterlife_bytes: homes[6],
+            live_devices: crate::live::live(crate::live::Kind::Device),
+            live_buffers: crate::live::live(crate::live::Kind::Buffer),
+            live_images: crate::live::live(crate::live::Kind::Image),
+            live_shadows: crate::live::live(crate::live::Kind::ShadowCopies),
+            live_texels: crate::live::live(crate::live::Kind::Texels),
+            live_queues: crate::live::live(crate::live::Kind::Queue),
+            live_command_buffers: crate::live::live(crate::live::Kind::CommandBuffer),
+            live_recorder_logs: crate::live::live(crate::live::Kind::Log),
+            live_copy_in_gates: crate::live::live(crate::live::Kind::CopyInGate),
             dma_buf_textures_in_place: counters.dma_buf_textures_in_place.load(Ordering::Relaxed),
             fresh_page_textures_in_place: counters
                 .fresh_page_textures_in_place

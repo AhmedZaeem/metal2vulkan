@@ -183,6 +183,8 @@ impl Drop for InstanceShared {
 
 /// Everything one device's objects share.
 pub(super) struct DeviceShared {
+    /// Counted while it lives (`live.rs`).
+    _counted: crate::live::Counted,
     /// The instance outlives the device.
     pub(super) instance: Arc<InstanceShared>,
     pub(super) physical: vk::PhysicalDevice,
@@ -1816,6 +1818,7 @@ impl Device {
         let sampler_ids = lock(&resource_ids).sampler_id_reads();
         let depth_ranges = DepthRanges::of(compile.profile());
         let shared = Arc::new(DeviceShared {
+            _counted: crate::live::Counted::new(crate::live::Kind::Device),
             instance,
             physical,
             functions: Arc::new(functions),

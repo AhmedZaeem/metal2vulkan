@@ -254,6 +254,7 @@ impl Device {
         texels: &Texels,
     ) -> Image {
         Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw,
             owner: Owner::Buffer {

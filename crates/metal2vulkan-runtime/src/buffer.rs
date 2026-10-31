@@ -78,6 +78,7 @@ impl WeakBuffer {
 }
 
 struct BufferShared {
+    _counted: crate::live::Counted,
     device: Device,
     /// Its identity (`object_id`).
     object_id: ObjectId,
@@ -2519,6 +2520,7 @@ impl Device {
     ) -> Buffer {
         let options = ResourceOptions::new(modes.storage, modes.cache, own.identity.mode());
         Buffer(Arc::new(BufferShared {
+            _counted: crate::live::Counted::new(crate::live::Kind::Buffer),
             device: self.clone(),
             object_id: ObjectId::new(),
             length,
@@ -2709,6 +2711,7 @@ impl Heap {
         options: ResourceOptions,
     ) -> Buffer {
         Buffer(Arc::new(BufferShared {
+            _counted: crate::live::Counted::new(crate::live::Kind::Buffer),
             device: heap_bytes.device().clone(),
             object_id: ObjectId::new(),
             length,

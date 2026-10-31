@@ -546,6 +546,7 @@ impl Storage {
 
 /// One `VkImage` and its memory, shared by a texture and every view of it.
 struct Image {
+    _counted: crate::live::Counted,
     device: Device,
     raw: Raw,
     /// Who owns the image and its memory, and so what its drop releases.
@@ -1867,6 +1868,7 @@ impl Device {
         // Moved by the device's next submission; it holds no memory yet, so nothing is zeroed.
         let first = FirstMove::new(raw, plan.format, vk::ImageLayout::UNDEFINED, None);
         let image = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(raw),
             owner: Owner::Sparse(Box::new(sparse)),
@@ -1994,6 +1996,7 @@ impl Device {
         };
         let hazard = heap.hazard_tracking_mode();
         Ok(Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(raw),
             owner: Owner::Sparse(Box::new(sparse)),
@@ -2819,6 +2822,7 @@ impl Device {
             return Err(vulkan(error));
         }
         let image = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(raw),
             owner: Owner::Buffer {
@@ -2872,6 +2876,7 @@ impl Device {
     ) -> Image {
         let crate::dma_buf::DmaBufImage { raw, import } = made;
         let image = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::imported(raw, import),
             owner,
@@ -3275,6 +3280,7 @@ impl Device {
         let first = FirstMove::new(raw, plan.format, vk::ImageLayout::UNDEFINED, None);
         let aspects: vk::ImageAspectFlags = image_aspects(plan.format).into();
         let image = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(raw),
             owner: owner(placement, raw),

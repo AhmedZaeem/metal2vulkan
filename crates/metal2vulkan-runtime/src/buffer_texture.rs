@@ -70,6 +70,8 @@ use std::sync::{Arc, Mutex};
 
 /// A texture's texels in a buffer's bytes, where Metal lays them out.
 pub(super) struct Texels {
+    /// Counted while it lives (`live.rs`).
+    _counted: crate::live::Counted,
     pub(super) buffer: Buffer,
     /// Where the GPU's commands find the texels in the buffer.
     pub(super) layout: BufferLayout,
@@ -1139,6 +1141,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         })
     }
 
@@ -1213,6 +1216,7 @@ impl Texels {
         // A rebind of the buffer's host pages empties the views (`rebind.rs`).
         buffer.watch_views(&views);
         Texels {
+            _counted: crate::live::Counted::new(crate::live::Kind::Texels),
             layout: placed,
             cpu: placed,
             shader: placed,
@@ -1310,6 +1314,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         };
         texels.staged = Some(Arc::new(copies));
         let (offset, alignment) = (
@@ -1472,6 +1477,7 @@ impl Texels {
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
             shared: std::sync::atomic::AtomicBool::new(false),
+            _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
         })
     }
 

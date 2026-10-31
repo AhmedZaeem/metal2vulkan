@@ -2891,6 +2891,7 @@ impl Device {
             internal("a heap texture's image does not lie where its plan placed it")
         })?;
         let made = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(raw),
             owner,
@@ -2932,6 +2933,7 @@ impl Device {
         stand_in: Arc<StandIn>,
     ) -> Image {
         Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: Raw::new(stand_in.read()),
             owner,
@@ -3398,6 +3400,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -3499,6 +3502,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,
@@ -3577,6 +3581,7 @@ impl Device {
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
                 shared: std::sync::atomic::AtomicBool::new(false),
+                _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
             };
             Owner::HeapShadow(Box::new(HeapShadow {
                 placement,

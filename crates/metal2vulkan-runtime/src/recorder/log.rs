@@ -340,12 +340,15 @@ pub(super) struct Log {
     generated: Arena<GeneratedCommandsInfo>,
     /// The gates of its gated copies in, which decide their regions as it replays.
     gates: Vec<Arc<CopyInGate>>,
+    /// Counted while it lives (`live.rs`).
+    _counted: crate::live::Counted,
 }
 
 impl Log {
     /// An empty log of `level`.
     pub(super) fn new(level: vk::CommandBufferLevel) -> Log {
         Log {
+            _counted: crate::live::Counted::new(crate::live::Kind::Log),
             index: 0,
             replays: None,
             real: AtomicU64::new(0),

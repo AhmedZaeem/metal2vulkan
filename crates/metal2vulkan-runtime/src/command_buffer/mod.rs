@@ -211,6 +211,7 @@ impl WeakCommandBuffer {
 }
 
 pub(super) struct CommandBufferShared {
+    _counted: crate::live::Counted,
     device: Device,
     queue: CommandQueue,
     state: Mutex<State>,
@@ -1800,6 +1801,7 @@ impl CommandBuffer {
     /// A new command buffer of `queue`, holding `slot` of it.
     pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
         CommandBuffer(Arc::new(CommandBufferShared {
+            _counted: crate::live::Counted::new(crate::live::Kind::CommandBuffer),
             device: queue.device().clone(),
             queue: queue.clone(),
             state: Mutex::new(State {

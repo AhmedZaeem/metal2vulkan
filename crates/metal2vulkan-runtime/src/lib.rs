@@ -220,6 +220,7 @@ mod versioned;
 mod view_plan;
 mod visibility;
 mod word_fill;
+mod live;
 mod work_counts;
 mod wrapped_buffer;
 mod ycbcr;

@@ -220,6 +220,8 @@ pub(super) struct ShadowCopies {
     /// copies in that copy nothing are counted apart
     /// (`WorkCounts::dirty_copies_in_skipped_in_shared_homes`).
     pub(super) shared: std::sync::atomic::AtomicBool,
+    /// Counted while it lives (`live.rs`).
+    pub(super) _counted: crate::live::Counted,
 }
 
 /// The texels of a texture over an IOSurface's plane from which its shadow's copies in count

@@ -619,6 +619,7 @@ impl Device {
             self.shared().interop.wrapped.insert(&caller);
         }
         let image = Image {
+            _counted: crate::live::Counted::new(crate::live::Kind::Image),
             device: self.clone(),
             raw: super::Raw::new(image),
             owner: Owner::Caller(caller),

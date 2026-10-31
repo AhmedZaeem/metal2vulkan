@@ -99,6 +99,7 @@ fn shadow_in(
         touched: AtomicU64::new(0),
         stood: AtomicU64::new(0),
         shared: std::sync::atomic::AtomicBool::new(false),
+        _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
     })
 }
 
@@ -1432,6 +1433,7 @@ fn view_of(image: ResourceKey, levels: Range<u32>, layers: Range<u32>) -> Arc<Sh
         touched: AtomicU64::new(0),
         stood: AtomicU64::new(0),
         shared: std::sync::atomic::AtomicBool::new(false),
+        _counted: crate::live::Counted::new(crate::live::Kind::ShadowCopies),
     })
 }
 

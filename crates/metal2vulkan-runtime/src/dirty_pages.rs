@@ -1109,6 +1109,7 @@ impl DirtyCommit {
         shadows: &DirtyShadows,
     ) -> Arc<CopyInGate> {
         let gate = Arc::new(CopyInGate {
+            _counted: crate::live::Counted::new(crate::live::Kind::CopyInGate),
             log,
             texel,
             tally: Arc::clone(&shadows.tally),
@@ -1153,6 +1154,7 @@ struct Decision {
 /// hold, where it is recorded before its submission decided, or where its log cannot say, else
 /// the rows of the pages changed since the hold.
 pub(crate) struct CopyInGate {
+    _counted: crate::live::Counted,
     log: Arc<ShadowLog>,
     /// The bytes of one texel in the buffer.
     texel: u64,

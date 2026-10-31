@@ -91,6 +91,7 @@ impl std::fmt::Debug for CommandQueue {
 }
 
 struct QueueShared {
+    _counted: crate::live::Counted,
     device: Device,
     /// The queue's identity among the device's logical queues.
     id: u64,
@@ -289,6 +290,7 @@ impl Device {
         self.make_texture_pool();
         self.keep_room();
         CommandQueue(Arc::new(QueueShared {
+            _counted: crate::live::Counted::new(crate::live::Kind::Queue),
             device: self.clone(),
             id,
             vk_queue: AtomicUsize::new(vk_queue),
