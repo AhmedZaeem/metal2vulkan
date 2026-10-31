@@ -383,8 +383,14 @@ struct Census {
     copies: AtomicU64,
     /// Recorded before its submission decided (a settle's replay).
     unplanned: AtomicU64,
-    /// No hold to count on.
+    /// No hold to count on: let go of by a write, or never taken.
     no_hold: AtomicU64,
+    /// Its command buffer wrote the truth or the shadow before the copy.
+    written_before: AtomicU64,
+    /// Its command buffer lies in more than one batch.
+    split: AtomicU64,
+    /// Another command buffer's writes keep the hold unsettled.
+    unsettled: AtomicU64,
     /// Its stamp not published at its replay.
     unpublished: AtomicU64,
     /// The rows changed came to half or more, or to too many bands.
@@ -399,6 +405,9 @@ struct Census {
 enum Whole {
     Unplanned,
     NoHold,
+    WrittenBefore,
+    Split,
+    Unsettled,
     Unpublished,
     MostRows,
 }
@@ -408,6 +417,9 @@ impl Census {
         let count = match why {
             Whole::Unplanned => &self.unplanned,
             Whole::NoHold => &self.no_hold,
+            Whole::WrittenBefore => &self.written_before,
+            Whole::Split => &self.split,
+            Whole::Unsettled => &self.unsettled,
             Whole::Unpublished => &self.unpublished,
             Whole::MostRows => &self.most_rows,
         };
@@ -415,7 +427,7 @@ impl Census {
     }
 
     /// Its counts, each set back to 0.
-    fn take(&self) -> [u64; 8] {
+    fn take(&self) -> [u64; 11] {
         [
             &self.copies,
             &self.unplanned,
@@ -425,6 +437,9 @@ impl Census {
             &self.skipped,
             &self.bytes_in,
             &self.bytes_back,
+            &self.written_before,
+            &self.split,
+            &self.unsettled,
         ]
         .map(|count| count.swap(0, Ordering::Relaxed))
     }
@@ -443,25 +458,29 @@ const CENSUS_NANOS: u64 = 1_000_000_000;
 fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
     let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20) / seconds;
     let rate = |count: u64| (count as f64 / seconds).round();
-    let mut rows: Vec<(String, [u64; 8])> = (logs.iter())
+    let mut rows: Vec<(String, [u64; 11])> = (logs.iter())
         .map(|log| (log.census_name(), log.census.take()))
         .filter(|(_, counts)| counts.iter().any(|&count| count != 0))
         .collect();
     rows.sort_by_key(|(_, counts)| std::cmp::Reverse(counts[6]));
-    let mut total = [0u64; 8];
+    let mut total = [0u64; 11];
     for (_, counts) in &rows {
         for (sum, count) in total.iter_mut().zip(counts) {
             *sum += count;
         }
     }
-    let line = |name: &str, c: &[u64; 8]| {
+    let line = |name: &str, c: &[u64; 11]| {
         format!(
             "m2v dirty census {name}: in {:.1} MiB/s, back {:.1} MiB/s; copies in {}/s: whole for \
-             no hold {}, unpublished {}, most rows {}, unplanned {}; skipped {}",
+             no hold {}, written before {}, split {}, unsettled {}, unpublished {}, most rows {}, \
+             unplanned {}; skipped {}",
             mib(c[6]),
             mib(c[7]),
             rate(c[0]),
             rate(c[2]),
+            rate(c[8]),
+            rate(c[9]),
+            rate(c[10]),
             rate(c[3]),
             rate(c[4]),
             rate(c[1]),
@@ -490,8 +509,8 @@ impl Drop for ShadowLog {
 }
 
 impl ShadowLog {
-    /// Its shadow's shape for the census: texels, rows' bytes, its truth's bytes, and whether a
-    /// home is shared or watched.
+    /// Its shadow's shape for the census: texels, rows' bytes, its truth's bytes and host address,
+    /// and whether a home is shared or watched.
     fn census_name(&self) -> String {
         let shape = self
             .copies
@@ -520,9 +539,10 @@ impl ShadowLog {
             });
         let watched = lock(&self.watch).is_some();
         format!(
-            "{} ({:.1} MB{})",
+            "{} ({:.1} MB at {:#x}{})",
             shape.unwrap_or_else(|| "gone".to_owned()),
             self.bytes() as f64 / 1e6,
+            self.source.pointer.wrapping_add(self.truth.start),
             if watched { "" } else { ", unwatched" }
         )
     }
@@ -876,11 +896,17 @@ impl DirtyShadows {
                 continue;
             };
             let unsettled = gate.log.unsettled.load(Ordering::Acquire) > 0;
-            let since = match gate.written_before || split || unsettled {
-                true => None,
-                false => gate.log.hold(),
+            let (since, unheld) = match (gate.written_before, split, unsettled) {
+                (true, _, _) => (None, Whole::WrittenBefore),
+                (_, true, _) => (None, Whole::Split),
+                (_, _, true) => (None, Whole::Unsettled),
+                _ => (gate.log.hold(), Whole::NoHold),
             };
-            *lock(&gate.decision) = Some(Decision { since, stamp });
+            *lock(&gate.decision) = Some(Decision {
+                since,
+                stamp,
+                unheld,
+            });
         }
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
         for log in &logs {
@@ -1008,6 +1034,8 @@ impl DirtyCommit {
 struct Decision {
     since: Option<DirtyStamp>,
     stamp: DirtyStamp,
+    /// Why `since` is `None` (the census's).
+    unheld: Whole,
 }
 
 /// A copy in of a shadow over logged host pages, its regions decided as its command buffer's
@@ -1093,31 +1121,37 @@ impl CopyInGate {
         if decision.is_none() {
             census.whole(Whole::Unplanned);
         }
-        let changed = decision.and_then(|Decision { since, stamp }| {
-            // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
-            // submission set to its own stamp ([`DirtyShadows::planned`]).
-            let published = self.log.source.published(stamp, &self.tally);
-            if published {
-                let mut held_at = lock(&self.held_at);
-                if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
-                    *held_at = Some(raised);
+        let changed = decision.and_then(
+            |Decision {
+                 since,
+                 stamp,
+                 unheld,
+             }| {
+                // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
+                // submission set to its own stamp ([`DirtyShadows::planned`]).
+                let published = self.log.source.published(stamp, &self.tally);
+                if published {
+                    let mut held_at = lock(&self.held_at);
+                    if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
+                        *held_at = Some(raised);
+                    }
                 }
-            }
-            if !published && self.held.load(Ordering::Relaxed) {
-                (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
-            }
-            let Some(since) = since else {
-                census.whole(Whole::NoHold);
-                return None;
-            };
-            if !published {
-                census.whole(Whole::Unpublished);
-                return None;
-            }
-            let mut runs = Vec::new();
-            (self.log.source.hook).changed_except(since, self.log.writer, &mut runs);
-            Some(runs)
-        });
+                if !published && self.held.load(Ordering::Relaxed) {
+                    (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
+                }
+                let Some(since) = since else {
+                    census.whole(unheld);
+                    return None;
+                };
+                if !published {
+                    census.whole(Whole::Unpublished);
+                    return None;
+                }
+                let mut runs = Vec::new();
+                (self.log.source.hook).changed_except(since, self.log.writer, &mut runs);
+                Some(runs)
+            },
+        );
         let Some(runs) = changed else {
             out.extend_from_slice(whole);
             census.bytes_in.fetch_add(total, Ordering::Relaxed);
