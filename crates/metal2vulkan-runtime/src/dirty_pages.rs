@@ -454,7 +454,8 @@ fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
     }
     let line = |name: &str, c: &[u64; 8]| {
         format!(
-            "m2v dirty census {name}: in {:.1} MiB/s, back {:.1} MiB/s; copies in {}/s: whole for              no hold {}, unpublished {}, most rows {}, unplanned {}; skipped {}",
+            "m2v dirty census {name}: in {:.1} MiB/s, back {:.1} MiB/s; copies in {}/s: whole for \
+             no hold {}, unpublished {}, most rows {}, unplanned {}; skipped {}",
             mib(c[6]),
             mib(c[7]),
             c[0],
