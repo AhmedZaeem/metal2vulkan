@@ -43,6 +43,10 @@
 //! made before its stamp's publication syncs to no later stamp than one already published, so a
 //! guest write made after it and before that harvest began reaches the next copy in.
 //!
+//! A shadow no copy in used for 250 ms lets go of its watch and its hold
+//! (`WorkCounts::dirty_watched_bytes_released`): its next copy in takes every row and watches
+//! again, and the one after takes none.
+//!
 //! A texture that renders and one that samples over the same logged bytes, laid out alike, at rows
 //! no linear image of the device takes (320 bytes for 64 texels), share one home
 //! (`texture/homes.rs`, `WorkCounts::shadow_homes_taken`): what the pass draws, the kernel reads
@@ -977,6 +981,74 @@ fn a_write_made_before_its_stamps_harvest_reaches_the_next_copy_in() {
         inverted(0x33),
         "the guest's row reaches the copy"
     );
+    drop(source);
+    drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn an_unused_shadow_lets_go_of_its_watch_and_its_hold() {
+    let scratch = Scratch::new("dirty-pages-idle");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let shadows = device.work_counts().shadowed_textures;
+    let mut descriptor = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    let source = buffer.new_texture(&descriptor, 0, ROW).unwrap();
+    if device.work_counts().shadowed_textures == shadows {
+        eprintln!("DIRTY-PAGES: no shadow made");
+        return;
+    }
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let watched = || {
+        let c = device.work_counts();
+        (c.dirty_watched_bytes, c.dirty_watched_bytes_released)
+    };
+
+    // Frames 1 and 2: every row, then none.
+    run(&device, &invert, &source, &target);
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    assert_eq!(delta(&device, before)[2], 1, "a held shadow copies nothing");
+    let (watching, _) = watched();
+    assert_eq!(watching, SIDE * ROW, "its truth's bytes watched");
+
+    // Unused past 250 ms: its next copy in lets go of the watch and the hold, then watches again.
+    std::thread::sleep(Duration::from_millis(300));
+    let (_, released) = watched();
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    let third = delta(&device, before);
+    let (watching, now_released) = watched();
+    eprintln!(
+        "DIRTY-PAGES: idle frame 3 {third:?}, released {}",
+        now_released - released
+    );
+    assert_eq!(
+        now_released - released,
+        SIDE * ROW,
+        "the idle watch let go of"
+    );
+    assert_eq!(third[1], 1, "every row: no hold after the watch went");
+    assert_eq!(watching, SIDE * ROW, "watched again");
+    let before = counts(&device);
+    run(&device, &invert, &source, &target);
+    assert_eq!(
+        delta(&device, before)[2],
+        1,
+        "then held again: nothing copied"
+    );
+    assert_eq!(texel(&target, 10), [0xef, 0xef, 0xef, 0x10]);
     drop(source);
     drop(buffer);
     drop(device);

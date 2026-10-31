@@ -4649,6 +4649,13 @@ pub struct WorkCounts {
     /// asked as their command buffer went at once, its gate finding no hold to count on when it
     /// was looked at.
     pub dirty_waits_unanswered_after_holds: u64,
+    /// The bytes of host pages the device's shadows over logged pages watch now
+    /// (`DirtyPages::watch`): each shadow's truth from its first gated copy in until it goes, or
+    /// until no copy in used it for 250 ms (`dirty_pages.rs`). What a VMM's harvest costs in.
+    pub dirty_watched_bytes: u64,
+    /// The bytes of watches those shadows let go of so far, no copy in having used them for 250
+    /// ms: each comes back with its next copy in, which takes every row.
+    pub dirty_watched_bytes_released: u64,
     /// The nanoseconds the questions took, on the threads that replay command buffers as they are
     /// submitted (the scheduler's, as a rule).
     pub dirty_wait_nanos: u64,
@@ -5608,6 +5615,8 @@ impl Device {
             dirty_waits_unanswered_after_holds: dirty
                 .unanswered_after_holds
                 .load(Ordering::Relaxed),
+            dirty_watched_bytes: dirty.watched_bytes.load(Ordering::Relaxed),
+            dirty_watched_bytes_released: dirty.watched_bytes_released.load(Ordering::Relaxed),
             dirty_wait_nanos: dirty.wait_nanos.load(Ordering::Relaxed),
             shadow_merge_copies_dispatched: counters
                 .shadow_merge_copies_dispatched

@@ -31,12 +31,19 @@
 //!   more than one batch may run its later batches after work submitted after its first: its
 //!   copies in count on no hold, it takes none, and its writes keep every hold they meet let go
 //!   of until it completes.
+//! - **Watched while in use.** A shadow's log watches its truth's bytes from its first gated copy
+//!   in, and lets go of the watch once no copy in used it for [`IDLE_WATCH_NANOS`], its hold with
+//!   it (an unwatched page reads as changed at every stamp): a VMM's harvest costs in what is
+//!   watched, and a surface a pool keeps but nothing draws holds nothing a copy needs. Its next
+//!   copy in watches again and takes every row (`WorkCounts::dirty_watched_bytes`,
+//!   `dirty_watched_bytes_released`).
 //! - **Correctness first.** A wait that answers `false`, a source that cannot say, and a copy
 //!   that holds nothing it may count on all copy every byte.
 //!
 //! [`HostMemory::with_dirty_pages`]: crate::HostMemory::with_dirty_pages
 
 use super::device::lock;
+use super::gpu_time;
 use super::resource::ResourceKey;
 use super::shadow::ShadowCopies;
 use super::tracker::Use;
@@ -350,7 +357,12 @@ pub(crate) struct ShadowLog {
     delta: u64,
     /// The truth's bytes, as the source's offsets.
     truth: Range<u64>,
-    _watch: Box<dyn Send + Sync>,
+    /// The watch over the truth's bytes; `None` once no copy in used the log for
+    /// [`IDLE_WATCH_NANOS`], its hold let go of with it, until its next use watches again.
+    watch: Mutex<Option<Box<dyn Send + Sync>>>,
+    /// The host nanoseconds of its last use, a gated copy in recorded ([`DirtyShadows::log`]).
+    last_used: AtomicU64,
+    tally: Arc<DirtyTally>,
     /// The stamp as of which the image holds every texel of the truth, but for the pages the log
     /// reports changed since (the module docs); `None` where it holds nothing a copy may count on.
     hold: Mutex<Hold>,
@@ -360,7 +372,51 @@ pub(crate) struct ShadowLog {
     unsettled: AtomicU64,
 }
 
+/// How long a shadow's log goes without a gated copy in before it lets go of its watch.
+const IDLE_WATCH_NANOS: u64 = 250_000_000;
+/// How often at most the logs are looked over for watches to let go of.
+const IDLE_SWEEP_NANOS: u64 = 50_000_000;
+
+impl Drop for ShadowLog {
+    fn drop(&mut self) {
+        let watched = self.watch.get_mut().map_or(true, |watch| watch.is_some());
+        if watched {
+            (self.tally.watched_bytes).fetch_sub(self.bytes(), Ordering::Relaxed);
+        }
+    }
+}
+
 impl ShadowLog {
+    /// How many bytes it watches while it watches.
+    fn bytes(&self) -> u64 {
+        self.truth.end.saturating_sub(self.truth.start)
+    }
+
+    /// A gated copy in uses it at the host nanoseconds `now`: watched again, where it had let go of
+    /// its watch.
+    fn used(&self, now: u64) {
+        self.last_used.store(now, Ordering::Relaxed);
+        let mut watch = lock(&self.watch);
+        if watch.is_none() {
+            *watch = Some(self.source.hook.watch(self.truth.clone()));
+            (self.tally.watched_bytes).fetch_add(self.bytes(), Ordering::Relaxed);
+        }
+    }
+
+    /// Let go of its watch where no copy in used it for [`IDLE_WATCH_NANOS`] by `now`, and of
+    /// its hold with it: the watch, for the caller to drop once it let go of the logs.
+    fn idle_watch(&self, now: u64) -> Option<Box<dyn Send + Sync>> {
+        if now.saturating_sub(self.last_used.load(Ordering::Relaxed)) < IDLE_WATCH_NANOS {
+            return None;
+        }
+        let watch = lock(&self.watch).take()?;
+        self.set_hold(None);
+        let bytes = self.bytes();
+        (self.tally.watched_bytes).fetch_sub(bytes, Ordering::Relaxed);
+        (self.tally.watched_bytes_released).fetch_add(bytes, Ordering::Relaxed);
+        Some(watch)
+    }
+
     /// The source's offsets of the `VkBuffer` bytes `range`.
     fn offsets(&self, range: Range<u64>) -> Range<u64> {
         range.start.wrapping_add(self.delta)..range.end.wrapping_add(self.delta)
@@ -431,6 +487,8 @@ pub(crate) struct DirtyShadows {
     /// Whether any log was ever made: a command buffer collects its writes only then.
     any: AtomicBool,
     tally: Arc<DirtyTally>,
+    /// The host nanoseconds the logs were last looked over for idle watches.
+    swept: AtomicU64,
 }
 
 /// The gated copies in, as `WorkCounts::dirty_copies_in_gated` and kin count them.
@@ -446,6 +504,8 @@ pub(crate) struct DirtyTally {
     pub(crate) waits: AtomicU64,
     pub(crate) waits_unanswered: AtomicU64,
     pub(crate) unanswered_after_holds: AtomicU64,
+    pub(crate) watched_bytes: AtomicU64,
+    pub(crate) watched_bytes_released: AtomicU64,
     pub(crate) wait_nanos: AtomicU64,
 }
 
@@ -465,8 +525,9 @@ impl DirtyShadows {
 
     /// The log of `copies`, whose truth lies at `truth` of the `VkBuffer` `raw` in pages logged by
     /// `source` (`raw`'s byte `v` at the host address `v + base`): kept, or made now, its watch
-    /// begun. A kept log of another source or `VkBuffer` (a rebind gave the buffer other pages)
-    /// is made again.
+    /// begun (again, where it let go of it). A kept log of another source or `VkBuffer` (a
+    /// rebind gave the buffer other pages) is made again. At most every [`IDLE_SWEEP_NANOS`], the
+    /// logs no copy in used for [`IDLE_WATCH_NANOS`] let go of their watches.
     pub(crate) fn log(
         &self,
         copies: &Arc<ShadowCopies>,
@@ -481,8 +542,15 @@ impl DirtyShadows {
         if offsets.start > offsets.end || base.checked_add(truth.start)? < source.pointer {
             return None;
         }
+        let now = gpu_time::host_nanos();
         let mut logs = lock(&self.logs);
         logs.retain(|log| log.copies.strong_count() > 0);
+        // Dropped once the logs are let go of: a watch's drop is the consumer's code.
+        let mut idle: Vec<Box<dyn Send + Sync>> = Vec::new();
+        if now.saturating_sub(self.swept.load(Ordering::Relaxed)) >= IDLE_SWEEP_NANOS {
+            self.swept.store(now, Ordering::Relaxed);
+            idle.extend(logs.iter().filter_map(|log| log.idle_watch(now)));
+        }
         let kept = logs.iter().position(|log| {
             std::ptr::eq(log.copies.as_ptr(), Arc::as_ptr(copies))
                 && Arc::ptr_eq(&log.source, source)
@@ -490,7 +558,11 @@ impl DirtyShadows {
                 && log.truth == offsets
         });
         if let Some(at) = kept {
-            return Some(Arc::clone(&logs[at]));
+            let log = Arc::clone(&logs[at]);
+            drop(logs);
+            drop(idle);
+            log.used(now);
+            return Some(log);
         }
         logs.retain(|log| !std::ptr::eq(log.copies.as_ptr(), Arc::as_ptr(copies)));
         let writer = NonZeroU64::new(NEXT_WRITER.fetch_add(1, Ordering::Relaxed))?;
@@ -501,12 +573,18 @@ impl DirtyShadows {
             raw,
             delta,
             truth: offsets.clone(),
-            _watch: source.hook.watch(offsets),
+            watch: Mutex::new(Some(source.hook.watch(offsets.clone()))),
+            last_used: AtomicU64::new(now),
+            tally: Arc::clone(&self.tally),
             hold: Mutex::new(Hold::default()),
             unsettled: AtomicU64::new(0),
         });
+        let bytes = offsets.end.saturating_sub(offsets.start);
+        (self.tally.watched_bytes).fetch_add(bytes, Ordering::Relaxed);
         logs.push(Arc::clone(&log));
         self.any.store(true, Ordering::Release);
+        drop(logs);
+        drop(idle);
         Some(log)
     }
 
