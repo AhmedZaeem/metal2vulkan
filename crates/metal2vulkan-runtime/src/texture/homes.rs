@@ -22,8 +22,9 @@
 //!   format (`Device::if_free`), so a texture that renders can take a home a sampled texture
 //!   made, and the other way.
 //! - **Kept a while** (the afterlife). The registry holds a home's image and copies, and its
-//!   texels weakly, so a home's last texture going leaves it: for [`AFTERLIFE_NANOS`], and
-//!   within [`AFTERLIFE_BYTES`] of such homes' images, the oldest going first, a texture made
+//!   texels weakly, so a home's last texture going leaves it: for [`AFTERLIFE_NANOS`], within
+//!   [`AFTERLIFE_BYTES`] of such homes' images in the process (every device's) and
+//!   [`AFTERLIFE_HOMES`] a device, the oldest going first, a texture made
 //!   over the same bytes again takes it with its log, hold and watch unbroken, or a copy in over
 //!   them takes its image as a base (`dirty_pages.rs`'s `Sibling`). A program that makes its
 //!   textures over a surface anew each frame copies only the rows that changed. It holds no
@@ -103,6 +104,20 @@ struct Registry {
     /// Whether the reaper sweeps it ([`reap`]): from its first home until it holds none, set
     /// under the homes' lock.
     reaped: std::sync::atomic::AtomicBool,
+    /// The host nanoseconds of its last sweep ([`HOT_SWEEP_NANOS`]).
+    swept_at: AtomicU64,
+    /// Its share of the process's counts after its last sweep: bytes kept, held, orphaned.
+    share: Mutex<[u64; 3]>,
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        let share = *self.share.get_mut().unwrap_or_else(|e| e.into_inner());
+        let [bytes, held, orphaned] = share;
+        KEPT_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        HELD.fetch_sub(held, Ordering::Relaxed);
+        ORPHANED.fetch_sub(orphaned, Ordering::Relaxed);
+    }
 }
 
 /// How often the reaper sweeps the registries that keep homes: a home its last texture left
@@ -148,6 +163,12 @@ fn reap(registry: &Arc<Registry>) {
 }
 
 impl Registry {
+    /// Whether a sweep is due as textures are made and copied in ([`HOT_SWEEP_NANOS`]).
+    fn due(&self) -> bool {
+        let now = crate::gpu_time::host_nanos();
+        now.saturating_sub(self.swept_at.load(Ordering::Relaxed)) >= HOT_SWEEP_NANOS
+    }
+
     /// The reaper's sweep: whether to sweep it again, where it holds any home.
     fn sweep_reaped(&self) -> bool {
         let mut gone = Vec::new();
@@ -183,8 +204,28 @@ struct AfterlifeTally {
 /// its successors' at low rates, and the time a log keeps its watch unused (`dirty_pages.rs`).
 const AFTERLIFE_NANOS: u64 = 250_000_000;
 
-/// The most bytes of images homes no texture holds keep, the longest kept going first.
+/// The most bytes of images homes no texture holds keep in the process, every device's
+/// registry's together ([`KEPT_BYTES`]), the longest kept going first.
 const AFTERLIFE_BYTES: u64 = 256 << 20;
+
+/// The most homes no texture holds a device's registry keeps.
+const AFTERLIFE_HOMES: usize = 32;
+
+/// How often at most a registry is swept as textures are made and copied in: the reaper sweeps
+/// it every [`REAP_EVERY`] besides, and an import's going or a rebind at once.
+const HOT_SWEEP_NANOS: u64 = 10_000_000;
+
+/// The bytes of images every registry's homes in their afterlife keep, and how many homes a
+/// texture holds and how many none does, in the process (`WorkCounts::home_afterlife_bytes`,
+/// `homes_held`, `homes_orphaned`).
+static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
+static HELD: AtomicU64 = AtomicU64::new(0);
+static ORPHANED: AtomicU64 = AtomicU64::new(0);
+
+/// The process's homes: the bytes kept, held homes and orphaned homes.
+pub(crate) fn process_homes() -> [u64; 3] {
+    [&KEPT_BYTES, &HELD, &ORPHANED].map(|count| count.load(Ordering::Relaxed))
+}
 
 /// A registry's entry as the afterlife's rules see it ([`sweep`]).
 trait Lived {
@@ -207,13 +248,21 @@ struct Swept {
     dropped: u64,
     /// The bytes the entries no texture holds keep, after it.
     bytes: u64,
+    /// The entries a texture holds, and those none does, after it.
+    held: u64,
+    orphans: u64,
 }
 
 /// Sweep `entries` at the host nanoseconds `now`: an entry whose pages went goes; one a texture
 /// holds is no orphan; one no texture holds begins its afterlife, and goes past
-/// [`AFTERLIFE_NANOS`] of it; then, past [`AFTERLIFE_BYTES`] of orphans, the longest orphaned go.
-/// What goes is moved to `gone`, for the caller to drop once it let go of the registry.
-fn sweep<L: Lived>(entries: &mut Vec<L>, now: u64, gone: &mut Vec<L>) -> Swept {
+/// [`AFTERLIFE_NANOS`] of it; then, past `budget` bytes or `most` orphans, the longest orphaned
+/// go. What goes is moved to `gone`, for the caller to drop once it let go of the registry.
+fn sweep<L: Lived>(
+    entries: &mut Vec<L>,
+    now: u64,
+    gone: &mut Vec<L>,
+    (budget, most): (u64, usize),
+) -> Swept {
     let mut swept = Swept::default();
     let mut at = 0;
     while at < entries.len() {
@@ -249,7 +298,8 @@ fn sweep<L: Lived>(entries: &mut Vec<L>, now: u64, gone: &mut Vec<L>) -> Swept {
             .sum()
     };
     let mut kept = orphans(entries);
-    while kept > AFTERLIFE_BYTES {
+    let mut count = (entries.iter()).filter(|e| e.orphaned().is_some()).count();
+    while kept > budget || count > most {
         let oldest = (entries.iter().enumerate())
             .filter_map(|(at, entry)| entry.orphaned().map(|since| (since, at)))
             .min()
@@ -259,10 +309,13 @@ fn sweep<L: Lived>(entries: &mut Vec<L>, now: u64, gone: &mut Vec<L>) -> Swept {
         };
         let entry = entries.swap_remove(oldest);
         kept -= entry.bytes();
+        count -= 1;
         swept.evicted += 1;
         gone.push(entry);
     }
     swept.bytes = kept;
+    swept.orphans = count as u64;
+    swept.held = entries.len() as u64 - swept.orphans;
     swept
 }
 
@@ -307,13 +360,15 @@ impl Registry {
         let (_, mine) = shadow_bytes(copies)?;
         let mut gone = Vec::new();
         let mut homes = lock(&self.homes);
-        self.swept(&mut homes, &mut gone);
+        if self.due() {
+            self.swept(&mut homes, &mut gone);
+        }
         let sibling = homes.iter().find_map(|home| {
             if home.host.as_ref().map(|bytes| bytes.start) != Some(host) {
                 return None;
             }
             let theirs = &home.copies;
-            if Arc::ptr_eq(theirs, copies) || theirs.tracked != copies.tracked {
+            if Arc::ptr_eq(theirs, copies) || theirs.tracked != copies.tracked || !home.pages() {
                 return None;
             }
             if shadow_bytes(theirs)?.1 != mine {
@@ -353,7 +408,23 @@ impl Registry {
     /// [`sweep`] `homes`, under their lock, into `gone`, counted, and the census's line a second.
     fn swept(&self, homes: &mut Vec<Home>, gone: &mut Vec<Home>) {
         let now = crate::gpu_time::host_nanos();
-        let swept = sweep(homes, now, gone);
+        self.swept_at.store(now, Ordering::Relaxed);
+        let mut share = lock(&self.share);
+        // The process's budget, less what the other registries keep.
+        let others = KEPT_BYTES.load(Ordering::Relaxed).saturating_sub(share[0]);
+        let budget = AFTERLIFE_BYTES.saturating_sub(others);
+        let swept = sweep(homes, now, gone, (budget, AFTERLIFE_HOMES));
+        let now_share = [swept.bytes, swept.held, swept.orphans];
+        for ((count, old), new) in [&KEPT_BYTES, &HELD, &ORPHANED]
+            .iter()
+            .zip(*share)
+            .zip(now_share)
+        {
+            count.fetch_add(new, Ordering::Relaxed);
+            count.fetch_sub(old, Ordering::Relaxed);
+        }
+        *share = now_share;
+        drop(share);
         let t = &self.tally;
         t.kept.fetch_add(swept.kept, Ordering::Relaxed);
         t.expired.fetch_add(swept.expired, Ordering::Relaxed);
@@ -403,12 +474,14 @@ impl Registry {
     fn take(&self, key: HomeKey, plan: &ImagePlan, texels: &Arc<Texels>) -> Option<Storage> {
         let mut gone = Vec::new();
         let mut homes = lock(&self.homes);
-        self.swept(&mut homes, &mut gone);
+        if self.due() {
+            self.swept(&mut homes, &mut gone);
+        }
         if crate::dirty_pages::census_on() {
             miss_lines(&homes, key, plan, texels);
         }
         let taken = (homes.iter_mut())
-            .filter(|home| home.key == key && serves(home.image.plan(), plan))
+            .filter(|home| home.key == key && serves(home.image.plan(), plan) && home.pages())
             .map(|home| {
                 // A home in its afterlife takes the new texture's texels, laid out as its own
                 // over the same buffer (the key's).
@@ -449,7 +522,9 @@ impl Registry {
         let bytes = u64::from(width) * u64::from(height) * u64::from(depth.max(1)) * texel;
         let mut gone = Vec::new();
         let mut homes = lock(&self.homes);
-        self.swept(&mut homes, &mut gone);
+        if self.due() || homes.len() >= HOMES {
+            self.swept(&mut homes, &mut gone);
+        }
         if homes.len() < HOMES {
             self.tally.made.fetch_add(1, Ordering::Relaxed);
             homes.push(Home {
@@ -667,7 +742,10 @@ pub(crate) fn shadow_bytes(copies: &ShadowCopies) -> Option<(ash::vk::Buffer, Sh
 
 #[cfg(test)]
 mod tests {
-    use super::{revive, sweep, Lived, Swept, AFTERLIFE_BYTES, AFTERLIFE_NANOS};
+    use super::{revive, sweep, Lived, Swept, AFTERLIFE_BYTES, AFTERLIFE_HOMES, AFTERLIFE_NANOS};
+
+    /// The process's whole budget and the registry's count.
+    const ALL: (u64, usize) = (AFTERLIFE_BYTES, AFTERLIFE_HOMES);
 
     /// An entry of the afterlife's rules alone.
     #[derive(Debug)]
@@ -709,19 +787,21 @@ mod tests {
     fn a_home_no_texture_holds_is_kept_until_it_expires() {
         let mut entries = vec![entry(false, 1 << 20), entry(true, 1 << 20)];
         let mut gone = Vec::new();
-        let first = sweep(&mut entries, 1_000, &mut gone);
+        let first = sweep(&mut entries, 1_000, &mut gone, ALL);
         assert_eq!(
             first,
             Swept {
                 kept: 1,
                 bytes: 1 << 20,
+                held: 1,
+                orphans: 1,
                 ..Swept::default()
             }
         );
         assert_eq!(entries.len(), 2, "kept, its afterlife begun");
-        let within = sweep(&mut entries, 1_000 + AFTERLIFE_NANOS, &mut gone);
+        let within = sweep(&mut entries, 1_000 + AFTERLIFE_NANOS, &mut gone, ALL);
         assert_eq!(within.expired, 0, "within its afterlife");
-        let past = sweep(&mut entries, 1_001 + AFTERLIFE_NANOS, &mut gone);
+        let past = sweep(&mut entries, 1_001 + AFTERLIFE_NANOS, &mut gone, ALL);
         assert_eq!(past.expired, 1);
         assert_eq!(entries.len(), 1, "the held one stays");
         assert_eq!(gone.len(), 1);
@@ -731,12 +811,16 @@ mod tests {
     fn a_home_taken_again_leaves_its_afterlife() {
         let mut entries = vec![entry(false, 1 << 20)];
         let mut gone = Vec::new();
-        sweep(&mut entries, 1_000, &mut gone);
+        sweep(&mut entries, 1_000, &mut gone, ALL);
         assert!(revive(&mut entries[0]), "taken out of its afterlife");
         entries[0].held = true;
         assert!(!revive(&mut entries[0]), "a held home is in none");
-        let later = sweep(&mut entries, 1_000 + 2 * AFTERLIFE_NANOS, &mut gone);
-        assert_eq!(later, Swept::default(), "held, it never expires");
+        let later = sweep(&mut entries, 1_000 + 2 * AFTERLIFE_NANOS, &mut gone, ALL);
+        let held = Swept {
+            held: 1,
+            ..Swept::default()
+        };
+        assert_eq!(later, held, "held, it never expires");
         assert_eq!(entries.len(), 1);
     }
 
@@ -747,24 +831,38 @@ mod tests {
         let mut gone = Vec::new();
         for at in 1..=3 {
             entries.push(entry(false, third));
-            sweep(&mut entries, at, &mut gone);
+            sweep(&mut entries, at, &mut gone, (AFTERLIFE_BYTES, usize::MAX));
         }
         let evicted: u64 = gone.len() as u64;
         assert_eq!(evicted, 1, "the third goes past the budget");
         assert_eq!(gone[0].orphaned, Some(1), "the longest kept");
         assert_eq!(entries.len(), 2);
-        let swept = sweep(&mut entries, 4, &mut gone);
+        let swept = sweep(&mut entries, 4, &mut gone, (AFTERLIFE_BYTES, usize::MAX));
         assert_eq!(swept.bytes, 2 * third);
+    }
+
+    #[test]
+    fn a_registry_keeps_a_few_homes_and_a_share_of_the_process_s_bytes() {
+        let mut entries: Vec<Entry> = (0..AFTERLIFE_HOMES + 3).map(|_| entry(false, 1)).collect();
+        let mut gone = Vec::new();
+        let swept = sweep(&mut entries, 1_000, &mut gone, ALL);
+        assert_eq!(swept.evicted, 3, "past the count a registry keeps");
+        assert_eq!(entries.len(), AFTERLIFE_HOMES);
+        // Other registries keep all but 10 bytes of the process's budget.
+        let mut entries: Vec<Entry> = (0..4).map(|_| entry(false, 4)).collect();
+        let swept = sweep(&mut entries, 1_000, &mut gone, (10, AFTERLIFE_HOMES));
+        assert_eq!(swept.bytes, 8, "within its share");
+        assert_eq!(swept.evicted, 2);
     }
 
     #[test]
     fn a_home_whose_pages_went_goes_at_once() {
         let mut entries = vec![entry(true, 1 << 20), entry(false, 1 << 20)];
         let mut gone = Vec::new();
-        sweep(&mut entries, 1_000, &mut gone);
+        sweep(&mut entries, 1_000, &mut gone, ALL);
         // A rebind moved the held one's bytes, and the kept one's buffer went.
         entries.iter_mut().for_each(|entry| entry.pages = false);
-        let swept = sweep(&mut entries, 1_001, &mut gone);
+        let swept = sweep(&mut entries, 1_001, &mut gone, ALL);
         assert_eq!(swept.dropped, 2, "both, held or kept, at once");
         assert!(entries.is_empty());
     }

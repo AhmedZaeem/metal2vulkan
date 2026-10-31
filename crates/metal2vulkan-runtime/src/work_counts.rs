@@ -4433,8 +4433,13 @@ pub struct WorkCounts {
     pub home_afterlives_evicted: u64,
     /// Homes dropped at once as their pages went: their buffer gone, or rebound.
     pub home_afterlives_dropped: u64,
-    /// The bytes of the images homes in their afterlife keep now.
+    /// The bytes of the images homes in their afterlife keep now, in the process (every
+    /// device's, within the process's 256 MiB).
     pub home_afterlife_bytes: u64,
+    /// The homes a texture holds now, in the process (every device's registry).
+    pub homes_held: u64,
+    /// The homes no texture holds now, in their afterlife, in the process (at most 32 a device).
+    pub homes_orphaned: u64,
     /// The runtime's objects that hold device memory or the device, live now in the process
     /// (`live.rs`): devices, buffers (the program's and the runtime's own), images, shadows and
     /// their texels, command queues, command buffers, recorder logs and copy-in gates. What grows
@@ -4969,6 +4974,7 @@ impl Device {
         self.shared().deferred.lower_all();
         let counters = &self.shared().counts;
         let homes = self.home_tally();
+        let process_homes = crate::texture::process_homes();
         // The driver's time in its pipeline makings (`device/compiles.rs`, by `VkDevice`), and
         // what the shader cache's directory cost (`shader_cache/store.rs`): neither is in
         // `Counters`.
@@ -5508,7 +5514,9 @@ impl Device {
             home_afterlives_expired: homes[3],
             home_afterlives_evicted: homes[4],
             home_afterlives_dropped: homes[5],
-            home_afterlife_bytes: homes[6],
+            home_afterlife_bytes: process_homes[0],
+            homes_held: process_homes[1],
+            homes_orphaned: process_homes[2],
             live_devices: crate::live::live(crate::live::Kind::Device),
             live_buffers: crate::live::live(crate::live::Kind::Buffer),
             live_images: crate::live::live(crate::live::Kind::Image),

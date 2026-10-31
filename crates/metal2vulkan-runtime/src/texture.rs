@@ -163,6 +163,7 @@ pub(super) mod heap_tiled;
 pub(super) mod heap_two_planes;
 pub(crate) mod held_depth;
 mod homes;
+pub(crate) use homes::process_homes;
 pub(crate) use homes::shadow_bytes;
 pub(crate) mod host_copy;
 pub(crate) mod host_shadow;
