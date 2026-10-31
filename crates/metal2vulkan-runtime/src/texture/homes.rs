@@ -195,6 +195,47 @@ fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan, texels: &Texels) {
     }
 }
 
+/// The shapes the census named a texture over logged pages that takes no home for, each once.
+static NO_HOMES: Mutex<Vec<([u32; 3], u64)>> = Mutex::new(Vec::new());
+
+/// Under the census, why a texture over logged host pages of 2^18 texels or more, planned as
+/// `plan` over `texels`, is no texture a home takes: each condition, the first time for its shape.
+pub(super) fn no_home_line(
+    device: &crate::Device,
+    texels: &Texels,
+    plan: &ImagePlan,
+    layout: &crate::texture::TextureLayout,
+) {
+    let logged = (texels.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some());
+    let texels_count = u64::from(plan.extent[0]) * u64::from(plan.extent[1]);
+    if !logged || texels_count < 1 << 18 {
+        return;
+    }
+    let seen = (plan.extent, texels.layout.row_pitch);
+    {
+        let mut shapes = lock(&NO_HOMES);
+        if shapes.contains(&seen) || shapes.len() >= 200 {
+            return;
+        }
+        shapes.push(seen);
+    }
+    eprintln!(
+        "m2v no home {}x{} rows {}: {}; detached {} type {:?} levels {} layers {} samples {:?} \
+         aspects {:#x} depth unit {}",
+        plan.extent[0],
+        plan.extent[1],
+        texels.layout.row_pitch,
+        texels.device_copy_why(device),
+        texels.buffer.detached(),
+        plan.image_type,
+        plan.levels,
+        plan.layers,
+        plan.samples,
+        super::texture_aspects(plan).as_raw(),
+        super::surface_depth_unit(layout.pixel_format).is_some(),
+    );
+}
+
 /// Whether a home's image of `home` serves a texture whose own image would be `plan`: of its shape,
 /// its format or one the home's image is viewed as, and usage and creation flags within the home's.
 fn serves(home: &ImagePlan, plan: &ImagePlan) -> bool {

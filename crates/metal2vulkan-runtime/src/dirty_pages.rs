@@ -32,7 +32,8 @@
 //!   copies in count on no hold, it takes none, and its writes keep every hold they meet let go
 //!   of until it completes.
 //! - **Watched while in use.** A shadow's log watches its truth's bytes from its first gated copy
-//!   in, and lets go of the watch once no copy in used it for [`IDLE_WATCH_NANOS`], its hold with
+//!   in, and lets go of the watch once no copy in was recorded or submitted over it for
+//!   [`IDLE_WATCH_NANOS`] (a command buffer waiting long in the scheduler keeps it), its hold with
 //!   it (an unwatched page reads as changed at every stamp): a VMM's harvest costs in what is
 //!   watched, and a surface a pool keeps but nothing draws holds nothing a copy needs. Its next
 //!   copy in watches again and takes every row (`WorkCounts::dirty_watched_bytes`,
@@ -866,7 +867,11 @@ impl DirtyShadows {
         held: &[Arc<ShadowCopies>],
         split: bool,
     ) {
+        // A log in use until its command buffers are submitted: one encoded long before keeps
+        // its watch while it waits (`IDLE_WATCH_NANOS`).
+        let now = gpu_time::host_nanos();
         for gate in &commit.gates {
+            gate.log.last_used.fetch_max(now, Ordering::Relaxed);
             let Some(stamp) = *lock(&gate.stamp) else {
                 continue;
             };

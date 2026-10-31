@@ -2375,6 +2375,9 @@ impl Device {
             && texture_aspects(&plan) == vk::ImageAspectFlags::COLOR
             && surface_depth_unit(layout.pixel_format).is_none())
         .then(|| homes::HomeKey::of(&texels, &plan, texels.tracked()));
+        if home.is_none() && crate::dirty_pages::census_on() {
+            homes::no_home_line(self, &texels, &plan, layout);
+        }
         if let Some(key) = home {
             if let Some(storage) = self.shared().textures.homes.take(key, &plan, &texels) {
                 self.shared().counts.shadow_home_taken();
