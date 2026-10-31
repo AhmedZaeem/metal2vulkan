@@ -148,6 +148,18 @@ pub trait DirtyPages: Send + Sync {
         None
     }
 
+    /// The identity of the log these answers come from, where sources of several memories over
+    /// the same host pages answer from one: two sources that give the same `Some` share its
+    /// stamps, its writers and its pages' watches, so a stamp one requested, a writer one was
+    /// told of, and a page's continuous watch begun through one are the other's too, each
+    /// answering in offsets from its own memory's pointer. The runtime then copies a shadow over
+    /// one memory in from another shadow's image over the same host bytes of the other, and
+    /// only the rows changed since that shadow's hold (`dirty_pages.rs`). `None` (the default):
+    /// no source but itself.
+    fn log_identity(&self) -> Option<u64> {
+        None
+    }
+
     /// Append to `out` the byte runs, as offsets from the memory's pointer, of the watched pages
     /// stamped later than `since`, and of those whose continuous watch began after it.
     fn changed(&self, since: DirtyStamp, out: &mut Vec<Range<u64>>);
@@ -183,6 +195,10 @@ pub(crate) trait DirtyHook: Send + Sync {
     fn published(&self, stamp: DirtyStamp) -> bool;
     /// [`DirtyPages::publication_hold`].
     fn publication_hold(&self) -> Option<Duration>;
+    /// [`DirtyPages::log_identity`].
+    fn log_identity(&self) -> Option<u64>;
+    /// The caller's source this hooks, by its address: one source's hooks share its answers.
+    fn source(&self) -> *const ();
     /// [`DirtyPages::wrote`].
     fn wrote_as_consumer(&self, range: Range<u64>);
     /// [`DirtyPages::wrote_as`].
@@ -210,6 +226,12 @@ where
     }
     fn publication_hold(&self) -> Option<Duration> {
         self.0.publication_hold()
+    }
+    fn log_identity(&self) -> Option<u64> {
+        self.0.log_identity()
+    }
+    fn source(&self) -> *const () {
+        Arc::as_ptr(&self.0).cast()
     }
     fn wrote_as_consumer(&self, range: Range<u64>) {
         self.0.wrote(range);
@@ -252,6 +274,13 @@ pub(crate) struct DirtySource {
 }
 
 impl DirtySource {
+    /// Whether `other`'s stamps, writers and watches are this source's: the caller's same
+    /// source's, or sources of one log ([`DirtyPages::log_identity`]).
+    fn shares_log(&self, other: &DirtySource) -> bool {
+        std::ptr::eq(self.hook.source(), other.hook.source())
+            || (self.hook.log_identity()).is_some_and(|id| other.hook.log_identity() == Some(id))
+    }
+
     /// `hook`, whose offsets count from `pointer`.
     pub(crate) fn new(hook: Arc<dyn DirtyHook>, pointer: u64) -> Arc<DirtySource> {
         Arc::new(DirtySource {
@@ -375,6 +404,25 @@ pub(crate) struct ShadowLog {
     unsettled: AtomicU64,
 }
 
+/// Another texture's home over the same host bytes as a shadow, through another buffer
+/// (`texture/homes.rs`): a gated copy in whose shadow holds
+/// nothing may take that home's image, held at a stamp, in place of the bytes, and copy from the
+/// pages only the rows changed since ([`DirtyShadows::planned`], [`CopyInGate::regions`]).
+/// `_keep` holds its image until the command buffer that copies from it goes.
+pub(crate) struct Sibling {
+    pub(crate) copies: Arc<ShadowCopies>,
+    pub(crate) _keep: Arc<dyn Send + Sync>,
+}
+
+/// A copy in's base: its sibling's image ([`Sibling`]) held at `since`, its writer's own writes
+/// in it, and its image and region for the copy.
+#[derive(Clone, Copy)]
+struct Base {
+    since: DirtyStamp,
+    writer: NonZeroU64,
+    image: vk::Image,
+}
+
 /// What one shadow's gated copies in and copies back moved since the census last printed them,
 /// and why each copy in that took every row did ([`DirtyShadows::log`],
 /// `METAL2VULKAN_LOG_DIRTY_CENSUS`): a diagnostic, which nothing reads to decide.
@@ -398,6 +446,8 @@ struct Census {
     skipped: AtomicU64,
     bytes_in: AtomicU64,
     bytes_back: AtomicU64,
+    /// Took a sibling's image as its base.
+    from_sibling: AtomicU64,
 }
 
 /// Why a gated copy in took every row ([`Census`]).
@@ -427,7 +477,7 @@ impl Census {
     }
 
     /// Its counts, each set back to 0.
-    fn take(&self) -> [u64; 11] {
+    fn take(&self) -> [u64; 12] {
         [
             &self.copies,
             &self.unplanned,
@@ -440,6 +490,7 @@ impl Census {
             &self.written_before,
             &self.split,
             &self.unsettled,
+            &self.from_sibling,
         ]
         .map(|count| count.swap(0, Ordering::Relaxed))
     }
@@ -458,22 +509,22 @@ const CENSUS_NANOS: u64 = 1_000_000_000;
 fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
     let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20) / seconds;
     let rate = |count: u64| (count as f64 / seconds).round();
-    let mut rows: Vec<(String, [u64; 11])> = (logs.iter())
+    let mut rows: Vec<(String, [u64; 12])> = (logs.iter())
         .map(|log| (log.census_name(), log.census.take()))
         .filter(|(_, counts)| counts.iter().any(|&count| count != 0))
         .collect();
     rows.sort_by_key(|(_, counts)| std::cmp::Reverse(counts[6]));
-    let mut total = [0u64; 11];
+    let mut total = [0u64; 12];
     for (_, counts) in &rows {
         for (sum, count) in total.iter_mut().zip(counts) {
             *sum += count;
         }
     }
-    let line = |name: &str, c: &[u64; 11]| {
+    let line = |name: &str, c: &[u64; 12]| {
         format!(
             "m2v dirty census {name}: in {:.1} MiB/s, back {:.1} MiB/s; copies in {}/s: whole for \
              no hold {}, written before {}, split {}, unsettled {}, unpublished {}, most rows {}, \
-             unplanned {}; skipped {}",
+             unplanned {}; from a sibling's image {}; skipped {}",
             mib(c[6]),
             mib(c[7]),
             rate(c[0]),
@@ -484,6 +535,7 @@ fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
             rate(c[3]),
             rate(c[4]),
             rate(c[1]),
+            rate(c[11]),
             rate(c[5]),
         )
     };
@@ -605,6 +657,12 @@ struct Hold {
 }
 
 impl ShadowLog {
+    /// The host addresses of its truth's bytes.
+    pub(crate) fn host(&self) -> Range<u64> {
+        let pointer = self.source.pointer;
+        pointer.wrapping_add(self.truth.start)..pointer.wrapping_add(self.truth.end)
+    }
+
     /// The hold as it stands.
     fn hold(&self) -> Option<DirtyStamp> {
         lock(&self.hold).stamp
@@ -675,6 +733,7 @@ pub(crate) struct DirtyTally {
     pub(crate) unanswered_after_holds: AtomicU64,
     pub(crate) watched_bytes: AtomicU64,
     pub(crate) watched_bytes_released: AtomicU64,
+    pub(crate) from_siblings: AtomicU64,
     pub(crate) wait_nanos: AtomicU64,
 }
 
@@ -849,6 +908,42 @@ impl DirtyShadows {
         }
     }
 
+    /// The base a gated copy in whose shadow holds nothing takes, as its command buffer is
+    /// submitted: its sibling's image ([`Sibling`]) where the sibling's log holds a stamp, no
+    /// write keeps it unsettled, its source shares this one's log, and both shadows' texels lie
+    /// at the same host addresses, laid out alike, in the `VkBuffer`s their logs were made over
+    /// (neither buffer rebound since). The tracker orders the copy after every write of the sibling's image
+    /// submitted before it and before every one after (the copy's read of it,
+    /// `EncoderCore::shadow_copies`), so the image holds the bytes as of that stamp but for the
+    /// pages other writers changed since, which the copy takes from the pages.
+    fn base(&self, gate: &CopyInGate) -> Option<Base> {
+        let sibling = gate.sibling.as_ref()?;
+        let log = self.kept(&sibling.copies)?;
+        // Its stamp and writer are asked of this log's source, of the same host bytes.
+        let alike = (gate.log.source).shares_log(&log.source) && gate.log.host() == log.host();
+        if !alike || log.unsettled.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let since = log.hold()?;
+        let mine = gate.log.copies.upgrade()?;
+        let (my_raw, my_layout) = crate::texture::shadow_bytes(&mine)?;
+        let (their_raw, their_layout) = crate::texture::shadow_bytes(&sibling.copies)?;
+        // Each buffer's bytes lie where its log was made (not rebound since), laid out alike.
+        let same = my_raw == gate.log.raw && their_raw == log.raw && my_layout == their_layout;
+        let ShadowSource::Bytes {
+            target: ShadowTarget::Image { image, .. },
+            ..
+        } = &sibling.copies.source
+        else {
+            return None;
+        };
+        same.then_some(Base {
+            since,
+            writer: log.writer,
+            image: *image,
+        })
+    }
+
     /// How long `commit`'s command buffer may be held for the publication of a stamp one of its
     /// gated copies in syncs to (the longest [`DirtyPages::publication_hold`] of them), where
     /// one of them could count on a hold as things stand and its source has not published its
@@ -902,10 +997,15 @@ impl DirtyShadows {
                 (_, _, true) => (None, Whole::Unsettled),
                 _ => (gate.log.hold(), Whole::NoHold),
             };
+            let base = match (since, unheld) {
+                (None, Whole::NoHold) => self.base(gate),
+                _ => None,
+            };
             *lock(&gate.decision) = Some(Decision {
                 since,
                 stamp,
                 unheld,
+                base,
             });
         }
         let logs: Vec<Arc<ShadowLog>> = lock(&self.logs).clone();
@@ -999,7 +1099,7 @@ impl DirtyCommit {
     /// `shadows`' tally.
     pub(crate) fn gate(
         &mut self,
-        (log, copies, texel): (Arc<ShadowLog>, &ShadowCopies, u64),
+        (log, copies, texel, sibling): (Arc<ShadowLog>, &ShadowCopies, u64, Option<Sibling>),
         shadows: &DirtyShadows,
     ) -> Arc<CopyInGate> {
         let gate = Arc::new(CopyInGate {
@@ -1011,6 +1111,7 @@ impl DirtyCommit {
             decision: Mutex::new(None),
             held_at: Mutex::new(None),
             held: AtomicBool::new(false),
+            sibling,
         });
         self.gates.push(Arc::clone(&gate));
         gate
@@ -1036,6 +1137,9 @@ struct Decision {
     stamp: DirtyStamp,
     /// Why `since` is `None` (the census's).
     unheld: Whole,
+    /// Where `since` is `None` for want of a hold, a sibling's image held at a stamp
+    /// ([`Sibling`]).
+    base: Option<Base>,
 }
 
 /// A copy in of a shadow over logged host pages, its regions decided as its command buffer's
@@ -1059,6 +1163,9 @@ pub(crate) struct CopyInGate {
     /// ([`DirtyShadows::awaits_publication`]), by which an answer `false` at its replay is counted
     /// apart (`WorkCounts::dirty_waits_unanswered_after_holds`).
     held: AtomicBool,
+    /// Another texture's home over the same bytes, found as the copy was recorded: the base its
+    /// submission may take ([`DirtyShadows::planned`]).
+    sibling: Option<Sibling>,
 }
 
 /// A run of rows more than this many rows from the next is copied apart.
@@ -1079,8 +1186,26 @@ impl CopyInGate {
         &self,
         whole: &[vk::BufferImageCopy],
         out: &mut Vec<vk::BufferImageCopy>,
-    ) {
-        let (total, copied) = self.chosen(whole, out);
+    ) -> Option<(vk::Image, vk::ImageCopy)> {
+        let (total, copied, base) = self.chosen(whole, out);
+        let from = base.and_then(|image| {
+            let region = whole.first()?;
+            let subresource = vk::ImageSubresourceLayers {
+                aspect_mask: region.image_subresource.aspect_mask,
+                mip_level: region.image_subresource.mip_level,
+                base_array_layer: region.image_subresource.base_array_layer,
+                layer_count: region.image_subresource.layer_count,
+            };
+            let copy = vk::ImageCopy {
+                src_subresource: subresource,
+                src_offset: region.image_offset,
+                dst_subresource: subresource,
+                dst_offset: region.image_offset,
+                extent: region.image_extent,
+            };
+            self.tally.from_siblings.fetch_add(1, Ordering::Relaxed);
+            Some((image, copy))
+        });
         let tally = &self.tally;
         tally.gated.fetch_add(1, Ordering::Relaxed);
         tally.bytes_whole.fetch_add(total, Ordering::Relaxed);
@@ -1095,14 +1220,16 @@ impl CopyInGate {
         } else if copied == total {
             tally.whole.fetch_add(1, Ordering::Relaxed);
         }
+        from
     }
 
-    /// [`regions`](Self::regions), uncounted: the bytes `whole` and the chosen regions move.
+    /// [`regions`](Self::regions), uncounted: the bytes `whole` and the chosen regions move, and
+    /// the sibling's image the copy takes first where it takes one.
     fn chosen(
         &self,
         whole: &[vk::BufferImageCopy],
         out: &mut Vec<vk::BufferImageCopy>,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, Option<vk::Image>) {
         out.clear();
         let bytes = |regions: &[vk::BufferImageCopy]| -> u64 {
             (regions.iter())
@@ -1117,60 +1244,58 @@ impl CopyInGate {
         let total = bytes(whole);
         let census = &self.log.census;
         census.copies.fetch_add(1, Ordering::Relaxed);
-        let decision = *lock(&self.decision);
-        if decision.is_none() {
-            census.whole(Whole::Unplanned);
-        }
-        let changed = decision.and_then(
-            |Decision {
-                 since,
-                 stamp,
-                 unheld,
-             }| {
-                // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
-                // submission set to its own stamp ([`DirtyShadows::planned`]).
-                let published = self.log.source.published(stamp, &self.tally);
-                if published {
-                    let mut held_at = lock(&self.held_at);
-                    if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
-                        *held_at = Some(raised);
-                    }
-                }
-                if !published && self.held.load(Ordering::Relaxed) {
-                    (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
-                }
-                let Some(since) = since else {
-                    census.whole(unheld);
-                    return None;
-                };
-                if !published {
-                    census.whole(Whole::Unpublished);
-                    return None;
-                }
-                let mut runs = Vec::new();
-                (self.log.source.hook).changed_except(since, self.log.writer, &mut runs);
-                Some(runs)
-            },
-        );
-        let Some(runs) = changed else {
-            out.extend_from_slice(whole);
-            census.bytes_in.fetch_add(total, Ordering::Relaxed);
-            return (total, total);
-        };
-        let banded = whole.iter().all(|region| self.bands(region, &runs, out));
-        if !banded || out.len() > REGIONS {
+        let every_row = |out: &mut Vec<vk::BufferImageCopy>, why: Whole| {
+            census.whole(why);
             out.clear();
             out.extend_from_slice(whole);
-            census.whole(Whole::MostRows);
             census.bytes_in.fetch_add(total, Ordering::Relaxed);
-            return (total, total);
+            (total, total, None)
+        };
+        let Some(decision) = *lock(&self.decision) else {
+            return every_row(out, Whole::Unplanned);
+        };
+        let Decision {
+            since,
+            stamp,
+            unheld,
+            base,
+        } = decision;
+        // Asked whatever the hold, so the copy, which runs after this, may raise the hold its
+        // submission set to its own stamp ([`DirtyShadows::planned`]).
+        let published = self.log.source.published(stamp, &self.tally);
+        if published {
+            let mut held_at = lock(&self.held_at);
+            if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
+                *held_at = Some(raised);
+            }
+        }
+        if !published && self.held.load(Ordering::Relaxed) {
+            (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
+        }
+        // Its own hold, else the sibling's image as of its stamp, but for what other writers
+        // changed since.
+        let (since, writer, taken) = match (since, base) {
+            (Some(since), _) => (since, self.log.writer, None),
+            (None, Some(base)) => (base.since, base.writer, Some(base.image)),
+            (None, None) => return every_row(out, unheld),
+        };
+        if !published {
+            return every_row(out, Whole::Unpublished);
+        }
+        let mut runs = Vec::new();
+        (self.log.source.hook).changed_except(since, writer, &mut runs);
+        let banded = whole.iter().all(|region| self.bands(region, &runs, out));
+        if !banded || out.len() > REGIONS {
+            return every_row(out, Whole::MostRows);
         }
         let copied = bytes(out);
         census.bytes_in.fetch_add(copied, Ordering::Relaxed);
-        if out.is_empty() {
-            census.skipped.fetch_add(1, Ordering::Relaxed);
-        }
-        (total, copied)
+        match (taken, out.is_empty()) {
+            (Some(_), _) => census.from_sibling.fetch_add(1, Ordering::Relaxed),
+            (None, true) => census.skipped.fetch_add(1, Ordering::Relaxed),
+            (None, false) => 0,
+        };
+        (total, copied, taken)
     }
 
     /// The full-width bands of `region`'s rows that the source's changed `runs` meet, into

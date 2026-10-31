@@ -57,7 +57,7 @@ use super::shadow_merge::ShadowMerge;
 use super::sparse::encoder::SparseUpdate;
 use super::texture::decoded_twin::TwinWrite;
 use super::texture::kept_image::KeptLease;
-use super::tracker::{Barrier, EncoderUses, Reach, Summary, Use, UseRange};
+use super::tracker::{Access, Barrier, EncoderUses, Reach, Summary, Use, UseRange};
 use super::unique_identifier::ScheduledWork;
 use super::used_resources::EncoderKind;
 use super::Device;
@@ -1612,7 +1612,7 @@ impl EncoderCore {
                 Some(_) => None,
                 None => copy.staged_back(&device),
             };
-            let (stages, uses) = match &dispatched {
+            let (stages, mut uses) = match &dispatched {
                 Some(_) => (
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     copy.dispatched_uses(),
@@ -1628,7 +1628,22 @@ impl EncoderCore {
                 Some(_) => None,
                 None => copy.gate_log(&device).map(|(log, texel)| {
                     let shadows = &device.shared().dirty;
-                    (self.open.command_buffer.dirty()).gate((log, &copy.copies, texel), shadows)
+                    // Another texture's home over the same bytes, whose image the copy may take:
+                    // read by it, so the tracker orders it against that image's writes.
+                    let sibling = device.sibling_home(&copy.copies, log.host().start);
+                    if let Some(sibling) = &sibling {
+                        uses.push(Use::reads(
+                            sibling.copies.shadow_key,
+                            sibling.copies.tracked,
+                            sibling.copies.shadow_range.clone(),
+                            Access::new(
+                                vk::PipelineStageFlags2::COPY,
+                                vk::AccessFlags2::TRANSFER_READ,
+                            ),
+                        ));
+                    }
+                    let gate = (log, &*copy.copies, texel, sibling);
+                    (self.open.command_buffer.dirty()).gate(gate, shadows)
                 }),
             };
             // A keep may copy the staging buffer its copy in filled only where that copy in

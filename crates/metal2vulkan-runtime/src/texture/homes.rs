@@ -30,8 +30,9 @@
 use super::{Image, ImagePlan, Storage};
 use crate::buffer_texture::Texels;
 use crate::device::lock;
+use crate::dirty_pages::Sibling;
 use crate::resource::ResourceKey;
-use crate::shadow::ShadowCopies;
+use crate::shadow::{ShadowCopies, ShadowSource, ShadowTarget};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -82,6 +83,32 @@ pub(super) struct ShadowHomes {
 const HOMES: usize = 256;
 
 impl ShadowHomes {
+    /// Another texture's live home whose first texel lies at the host address `host`, as the
+    /// first of `copies` does, laid out alike, of its tracking: through any buffer over those
+    /// host bytes, from any task. A gated copy in of `copies` may take its image as a base
+    /// (`dirty_pages.rs`'s `Sibling`), which its submission checks again.
+    pub(super) fn sibling(&self, copies: &Arc<ShadowCopies>, host: u64) -> Option<Sibling> {
+        let (_, mine) = shadow_bytes(copies)?;
+        let homes = lock(&self.homes);
+        homes.iter().find_map(|home| {
+            if home.host.as_ref().map(|bytes| bytes.start) != Some(host) {
+                return None;
+            }
+            let theirs = home.copies.upgrade()?;
+            if Arc::ptr_eq(&theirs, copies) || theirs.tracked != copies.tracked {
+                return None;
+            }
+            if shadow_bytes(&theirs)?.1 != mine {
+                return None;
+            }
+            let keep: Arc<dyn Send + Sync> = home.image.upgrade()?;
+            Some(Sibling {
+                copies: theirs,
+                _keep: keep,
+            })
+        })
+    }
+
     /// The storage of a live home of `key` whose image serves a texture planned as `plan`, marked
     /// shared; `None` where none does.
     pub(super) fn take(&self, key: HomeKey, plan: &ImagePlan, texels: &Texels) -> Option<Storage> {
@@ -247,4 +274,51 @@ fn serves(home: &ImagePlan, plan: &ImagePlan) -> bool {
         && home.usage.contains(plan.usage)
         && home.flags.contains(plan.flags)
         && (home.format == plan.format || home.view_formats.contains(&plan.format))
+}
+
+/// How a shadow's texels are laid out in its bytes: rows' and images' texels, the image's
+/// aspect, level and layers, the region's offset and extent, and the texel's bytes.
+pub(crate) type ShadowLayout = ([u32; 6], [i32; 3], [u32; 3], u64);
+
+/// Where a shadow's texels lie now, for telling two shadows over the same host bytes apart: its
+/// `VkBuffer`, and their layout there; `None` where they lie in no one region of a `VkBuffer`,
+/// or nowhere (a buffer gone or detached).
+pub(crate) fn shadow_bytes(copies: &ShadowCopies) -> Option<(ash::vk::Buffer, ShadowLayout)> {
+    let ShadowSource::Bytes {
+        buffer,
+        target:
+            ShadowTarget::Image {
+                regions,
+                staging: None,
+                texel: Some(texel),
+                ..
+            },
+        ..
+    } = &copies.source
+    else {
+        return None;
+    };
+    let [region] = &regions[..] else {
+        return None;
+    };
+    let raw = buffer.raw();
+    if raw == ash::vk::Buffer::null() {
+        return None;
+    }
+    let sub = region.image_subresource;
+    let (offset, extent) = (region.image_offset, region.image_extent);
+    let layout = (
+        [
+            region.buffer_row_length,
+            region.buffer_image_height,
+            sub.aspect_mask.as_raw(),
+            sub.mip_level,
+            sub.base_array_layer,
+            sub.layer_count,
+        ],
+        [offset.x, offset.y, offset.z],
+        [extent.width, extent.height, extent.depth],
+        *texel,
+    );
+    Some((raw, layout))
 }

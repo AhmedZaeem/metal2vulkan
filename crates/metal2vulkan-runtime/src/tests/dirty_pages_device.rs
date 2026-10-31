@@ -55,6 +55,11 @@
 //! sRGB render target made takes a sampled `Unorm` texture over the same bytes too: its image
 //! takes the sampled usage that texture needs, where free (the iOS Simulator's screen).
 //!
+//! A sampled texture over another no-copy buffer of the same bytes, which takes no home of the
+//! render target's buffer, copies the render target's home's image into its own in place of the
+//! pages (`WorkCounts::dirty_copies_in_from_siblings`), and from the pages only what other
+//! writers changed since: it reads what the pass drew and a CPU write the log tells.
+//!
 //! A render target over such pages, loaded by a pass whose draws' scissor bounds them to rows 0
 //! to 8, copies in every texel the first time and then only the rows the log reports changed: its
 //! copy in is not cut to the scissor, so the image holds every texel for the next command buffer,
@@ -1100,5 +1105,81 @@ fn a_home_an_srgb_render_target_made_takes_a_sampled_texture() {
     );
     drop((producer, reader));
     drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn a_texture_over_another_buffer_of_the_bytes_copies_in_from_the_home() {
+    const PITCH: u64 = 320;
+    let scratch = Scratch::new("dirty-pages-sibling");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let (Some(first), Some(second)) = (
+        over_logged(&device, &host, &log),
+        over_logged(&device, &host, &log),
+    ) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let mut rendered = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    rendered.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let producer = first.new_texture(&rendered, 0, PITCH).unwrap();
+    let mut sampled = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    sampled.usage = TextureUsage::SHADER_READ;
+    let reader = second.new_texture(&sampled, 0, PITCH).unwrap();
+    let device_copies = device.work_counts().device_copy_textures;
+    if device_copies == 0 {
+        eprintln!("DIRTY-PAGES: no device copies (an integrated GPU)");
+        return;
+    }
+    // The reader is one: the second buffer lies in the first's import, and keeps its log as the
+    // first does (the pass's texture, a render target, is a shadow whose copies in it gates too).
+    assert_eq!(device_copies, 1, "the reader is a device copy");
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let siblings = || device.work_counts().dirty_copies_in_from_siblings;
+    let bytes = first.contents().unwrap().as_ptr();
+
+    // Frame 1: the pass draws rows 0 to 8 red over the first buffer; the reader, over the second,
+    // takes the pass's home's image.
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    let (before, taken) = (counts(&device), siblings());
+    run(&device, &invert, &reader, &target);
+    let first_read = delta(&device, before);
+    let took = siblings() - taken;
+    eprintln!("DIRTY-PAGES: sibling frame 1 {first_read:?}, from siblings {took}");
+    assert_eq!(texel(&target, 0), [0, 255, 255, 255], "the pass's red");
+    assert_eq!(
+        texel(&target, 20),
+        [0xef, 0xef, 0xef, 0x10],
+        "the pages' bytes elsewhere"
+    );
+    assert_eq!(took, 1, "copied in from the home over the other buffer");
+    assert_eq!(first_read[4], 0, "and nothing from the pages");
+
+    // Frame 2: a CPU write the log tells, the pass's green; the reader sees both.
+    // SAFETY: a row of the buffers' bytes, which no command uses now.
+    unsafe { std::ptr::write_bytes(bytes.add((40 * PITCH) as usize), 0x40, (SIDE * 4) as usize) };
+    log.told(40 * PITCH..41 * PITCH, 0);
+    draw_rows(&device, &producer, [0.0, 1.0, 0.0, 1.0]);
+    let taken = siblings();
+    run(&device, &invert, &reader, &target);
+    eprintln!(
+        "DIRTY-PAGES: sibling frame 2 from siblings {}",
+        siblings() - taken
+    );
+    assert_eq!(texel(&target, 0), [255, 0, 255, 255], "the pass's green");
+    assert_eq!(
+        texel(&target, 40),
+        [0xbf, 0xbf, 0xbf, 0x40],
+        "the CPU's row"
+    );
+    drop((producer, reader));
+    drop((first, second));
     drop(device);
 }

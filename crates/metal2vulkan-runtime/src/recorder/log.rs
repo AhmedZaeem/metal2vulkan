@@ -1465,7 +1465,39 @@ impl Log {
                     } => {
                         let whole = self.buffer_images.get(regions);
                         let mut chosen = Vec::new();
-                        self.gates[gate as usize].regions(whole, &mut chosen);
+                        let base = self.gates[gate as usize].regions(whole, &mut chosen);
+                        // A sibling's image first, then the rows changed since its stamp, after a
+                        // barrier between the two copies' writes of the image.
+                        if let Some((image, copy)) = base {
+                            call!(
+                                CmdCopyImage,
+                                vk::PFN_vkCmdCopyImage,
+                                image,
+                                vk::ImageLayout::GENERAL,
+                                dst,
+                                layout,
+                                1,
+                                &copy
+                            );
+                            let barrier = vk::MemoryBarrier {
+                                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                                dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                                ..Default::default()
+                            };
+                            call!(
+                                CmdPipelineBarrier,
+                                vk::PFN_vkCmdPipelineBarrier,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                1,
+                                &barrier,
+                                0,
+                                std::ptr::null(),
+                                0,
+                                std::ptr::null()
+                            );
+                        }
                         if !chosen.is_empty() {
                             call!(
                                 CmdCopyBufferToImage,

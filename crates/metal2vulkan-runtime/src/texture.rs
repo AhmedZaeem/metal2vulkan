@@ -163,6 +163,7 @@ pub(super) mod heap_tiled;
 pub(super) mod heap_two_planes;
 pub(crate) mod held_depth;
 mod homes;
+pub(crate) use homes::shadow_bytes;
 pub(crate) mod host_copy;
 pub(crate) mod host_shadow;
 mod in_place_image;
@@ -2492,6 +2493,16 @@ impl Device {
         });
         self.shared().counts.shadowed_texture_made(aspects != every);
         Ok(storage)
+    }
+
+    /// Another texture's live home over the same host bytes as `copies`, whose first texel lies
+    /// at the host address `host` (`texture/homes.rs`).
+    pub(crate) fn sibling_home(
+        &self,
+        copies: &Arc<ShadowCopies>,
+        host: u64,
+    ) -> Option<crate::dirty_pages::Sibling> {
+        self.shared().textures.homes.sibling(copies, host)
     }
 
     /// `plan`, a home's image's of a texture of `layout` and Metal `usage` (`texture/homes.rs`),

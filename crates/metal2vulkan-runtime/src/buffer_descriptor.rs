@@ -509,6 +509,12 @@ impl Device {
             let address = self.place_window(placement, &window, length)?;
             let buffer =
                 self.buffer_in_import(Arc::clone(&import), length, modes, address, release);
+            // The caller's log of the pages' writes stays with these pages too (`dirty_pages.rs`).
+            if let Some(dirty) = dirty {
+                if let Some(pages) = buffer.host_pages() {
+                    pages.keep_dirty(dirty);
+                }
+            }
             shared
                 .aliases
                 .join(buffer.identity().key, made_over, class, &import);

@@ -4656,6 +4656,10 @@ pub struct WorkCounts {
     /// The bytes of watches those shadows let go of so far, no copy in having used them for 250
     /// ms: each comes back with its next copy in, which takes every row.
     pub dirty_watched_bytes_released: u64,
+    /// Gated copies in that took another texture's home over the same host bytes as their base
+    /// (`dirty_pages.rs`'s `Sibling`): its image copied into theirs in the device's memory, then
+    /// from the pages only the rows other writers changed since its stamp.
+    pub dirty_copies_in_from_siblings: u64,
     /// The nanoseconds the questions took, on the threads that replay command buffers as they are
     /// submitted (the scheduler's, as a rule).
     pub dirty_wait_nanos: u64,
@@ -5617,6 +5621,7 @@ impl Device {
                 .load(Ordering::Relaxed),
             dirty_watched_bytes: dirty.watched_bytes.load(Ordering::Relaxed),
             dirty_watched_bytes_released: dirty.watched_bytes_released.load(Ordering::Relaxed),
+            dirty_copies_in_from_siblings: dirty.from_siblings.load(Ordering::Relaxed),
             dirty_wait_nanos: dirty.wait_nanos.load(Ordering::Relaxed),
             shadow_merge_copies_dispatched: counters
                 .shadow_merge_copies_dispatched
