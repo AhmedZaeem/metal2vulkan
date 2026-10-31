@@ -430,7 +430,7 @@ impl Census {
 }
 
 /// Whether the census of the logged shadows' copies prints (`METAL2VULKAN_LOG_DIRTY_CENSUS`).
-fn census_on() -> bool {
+pub(crate) fn census_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(metal2vulkan::env_vars::log_dirty_census)
 }
@@ -441,6 +441,7 @@ const CENSUS_NANOS: u64 = 1_000_000_000;
 /// The census lines of `logs`, the most bytes copied in first, eight at most, and a total.
 fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
     let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20) / seconds;
+    let rate = |count: u64| (count as f64 / seconds).round();
     let mut rows: Vec<(String, [u64; 8])> = (logs.iter())
         .map(|log| (log.census_name(), log.census.take()))
         .filter(|(_, counts)| counts.iter().any(|&count| count != 0))
@@ -458,12 +459,12 @@ fn census_lines(logs: &[Arc<ShadowLog>], seconds: f64) -> Vec<String> {
              no hold {}, unpublished {}, most rows {}, unplanned {}; skipped {}",
             mib(c[6]),
             mib(c[7]),
-            c[0],
-            c[2],
-            c[3],
-            c[4],
-            c[1],
-            c[5],
+            rate(c[0]),
+            rate(c[2]),
+            rate(c[3]),
+            rate(c[4]),
+            rate(c[1]),
+            rate(c[5]),
         )
     };
     let mut lines: Vec<String> = (rows.iter().take(8))
@@ -756,6 +757,17 @@ impl DirtyShadows {
     pub(crate) fn completed(&self, commit: &mut DirtyCommit, failed: bool) {
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
+        }
+        // A source that answers at once is asked again whether the stamps its gated copies in
+        // synced to are published, by now most often: what it answers counts for later holds
+        // alone (`planned`), each a stamp published before a later copy in runs. Without it a
+        // shadow whose command buffers go as they commit, asking only before a harvest could
+        // publish, would never find a stamp published, nor take a hold.
+        for gate in &commit.gates {
+            let source = &gate.log.source;
+            if let (Some(stamp), Some(_)) = (*lock(&gate.stamp), source.hook.publication_hold()) {
+                source.published_now(stamp);
+            }
         }
         for log in commit.unsettling.drain(..) {
             log.unsettled.fetch_sub(1, Ordering::AcqRel);

@@ -85,6 +85,9 @@ impl ShadowHomes {
     pub(super) fn take(&self, key: HomeKey, plan: &ImagePlan) -> Option<Storage> {
         let mut homes = lock(&self.homes);
         homes.retain(|home| home.copies.strong_count() > 0);
+        if crate::dirty_pages::census_on() {
+            miss_lines(&homes, key, plan);
+        }
         (homes.iter())
             .filter(|home| home.key == key)
             .find_map(|home| {
@@ -122,6 +125,57 @@ impl ShadowHomes {
                 texels: Arc::downgrade(texels),
                 copies: Arc::downgrade(copies),
             });
+        }
+    }
+}
+
+/// How many home misses the census printed (`METAL2VULKAN_LOG_DIRTY_CENSUS`), past which it
+/// prints none.
+static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Under the census, why no live home serves a texture of `key` planned as `plan` where one of its
+/// shape lies over another buffer, or over its bytes but serves it not: a diagnostic, printed
+/// for the first 40.
+fn miss_lines(homes: &[Home], key: HomeKey, plan: &ImagePlan) {
+    let near = |home: &&Home| {
+        home.key.extent == key.extent
+            && home.key.row_pitch == key.row_pitch
+            && home.key.texel == key.texel
+    };
+    for home in homes.iter().filter(near) {
+        let Some(image) = home.image.upgrade() else {
+            continue;
+        };
+        let theirs = image.plan();
+        let why = match home.key == key {
+            false => format!(
+                "a home of its shape over other bytes (buffer {:?} offset {} tracked {}, its \
+                 {:?} offset {} tracked {})",
+                home.key.buffer,
+                home.key.offset,
+                home.key.tracked,
+                key.buffer,
+                key.offset,
+                key.tracked
+            ),
+            true if serves(theirs, plan) => continue,
+            true => format!(
+                "the home's image serves it not: format {:?} views {:?} usage {:?} flags {:?}, \
+                 its format {:?} usage {:?} flags {:?}",
+                theirs.format,
+                theirs.view_formats,
+                theirs.usage,
+                theirs.flags,
+                plan.format,
+                plan.usage,
+                plan.flags
+            ),
+        };
+        if MISSES.fetch_add(1, Ordering::Relaxed) < 40 {
+            eprintln!(
+                "m2v home miss {}x{} rows {}: {why}",
+                key.extent[0], key.extent[1], key.row_pitch
+            );
         }
     }
 }
