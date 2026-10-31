@@ -251,6 +251,14 @@ pub(crate) fn in_place(
     in_place_rendering(policy, usage, class, verdict, false)
 }
 
+/// Whether a render target over host pages may render in place where the device renders linear
+/// images: yes unless `M2V_LINEAR_RENDER_TARGETS=0`, which keeps them shadows, to measure one
+/// against the other. Read once per process.
+pub(crate) fn linear_render_targets_allowed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("M2V_LINEAR_RENDER_TARGETS").is_none_or(|v| v != "0"))
+}
+
 /// [`in_place`], where a render target is tried as an image in place too when `renders_linear`:
 /// the device renders a linear image of the texture's format as a color attachment
 /// (`ImageFacts::linear`, `VK_NV_linear_color_attachment`'s rule kept by `linear_attachment.rs`),

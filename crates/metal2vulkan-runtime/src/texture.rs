@@ -2252,9 +2252,10 @@ impl Device {
                     };
                     // A render target over the pages renders in place where the device renders a
                     // linear image of its format as a color attachment (`in_place_rendering`).
-                    let renders_linear = facts
-                        .linear(plan.format)
-                        .contains(FormatFeatureFlags2::COLOR_ATTACHMENT);
+                    let renders_linear = in_place::linear_render_targets_allowed()
+                        && facts
+                            .linear(plan.format)
+                            .contains(FormatFeatureFlags2::COLOR_ATTACHMENT);
                     match in_place::in_place_rendering(
                         policy,
                         usage,
