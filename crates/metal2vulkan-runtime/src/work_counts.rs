@@ -4644,6 +4644,11 @@ pub struct WorkCounts {
     /// Of the questions, those the log answered `false`: not published yet as the command buffer
     /// was submitted, or the log cannot say. The copy took every row.
     pub dirty_waits_unanswered: u64,
+    /// Of those, the ones whose command buffer the scheduler had held for the stamp's publication
+    /// (`heads_held_for_dirty_publications`) until the log's hold bound passed: the rest were
+    /// asked as their command buffer went at once, its gate finding no hold to count on when it
+    /// was looked at.
+    pub dirty_waits_unanswered_after_holds: u64,
     /// The nanoseconds the questions took, on the threads that replay command buffers as they are
     /// submitted (the scheduler's, as a rule).
     pub dirty_wait_nanos: u64,
@@ -5600,6 +5605,9 @@ impl Device {
             dirty_stamps_asked: dirty.stamps.load(Ordering::Relaxed),
             dirty_waits: dirty.waits.load(Ordering::Relaxed),
             dirty_waits_unanswered: dirty.waits_unanswered.load(Ordering::Relaxed),
+            dirty_waits_unanswered_after_holds: dirty
+                .unanswered_after_holds
+                .load(Ordering::Relaxed),
             dirty_wait_nanos: dirty.wait_nanos.load(Ordering::Relaxed),
             shadow_merge_copies_dispatched: counters
                 .shadow_merge_copies_dispatched

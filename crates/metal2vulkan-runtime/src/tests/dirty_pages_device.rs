@@ -719,11 +719,18 @@ fn a_held_command_buffer_waits_for_its_stamp_and_holds_back_no_other_queue() {
     *log.hold.lock().unwrap() = Some(Duration::from_millis(20));
     log.pending.store(true, Ordering::SeqCst);
     let before = counts(&device);
+    let after_holds = || device.work_counts().dirty_waits_unanswered_after_holds;
+    let unanswered = after_holds();
     run(&device, &invert, &source, &target);
     log.pending.store(false, Ordering::SeqCst);
     let third = delta(&device, before);
     eprintln!("DIRTY-PAGES: hold frame 3 (never published) {third:?}");
     assert_eq!(third[1], 1, "every row at the hold's end");
+    assert_eq!(
+        after_holds() - unanswered,
+        1,
+        "counted as unanswered after a hold"
+    );
     drop(source);
     drop(buffer);
     drop(device);

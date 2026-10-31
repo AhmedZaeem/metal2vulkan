@@ -445,6 +445,7 @@ pub(crate) struct DirtyTally {
     pub(crate) stamps: AtomicU64,
     pub(crate) waits: AtomicU64,
     pub(crate) waits_unanswered: AtomicU64,
+    pub(crate) unanswered_after_holds: AtomicU64,
     pub(crate) wait_nanos: AtomicU64,
 }
 
@@ -589,7 +590,11 @@ impl DirtyShadows {
                 let counts = !gate.written_before
                     && gate.log.unsettled.load(Ordering::Acquire) == 0
                     && gate.log.hold().is_some();
-                (counts && !source.published_now(stamp)).then_some(bound)
+                let awaits = counts && !source.published_now(stamp);
+                if awaits {
+                    gate.held.store(true, Ordering::Relaxed);
+                }
+                awaits.then_some(bound)
             })
             .max()
     }
@@ -722,6 +727,7 @@ impl DirtyCommit {
             stamp: Mutex::new(None),
             decision: Mutex::new(None),
             held_at: Mutex::new(None),
+            held: AtomicBool::new(false),
         });
         self.gates.push(Arc::clone(&gate));
         gate
@@ -764,6 +770,10 @@ pub(crate) struct CopyInGate {
     /// The generation of the log's hold its submission set, or its replay raised, which its
     /// failure lets go of ([`DirtyShadows::planned`]).
     held_at: Mutex<Option<u64>>,
+    /// The scheduler held its command buffer for its stamp's publication
+    /// ([`DirtyShadows::awaits_publication`]), by which an answer `false` at its replay is counted
+    /// apart (`WorkCounts::dirty_waits_unanswered_after_holds`).
+    held: AtomicBool,
 }
 
 /// A run of rows more than this many rows from the next is copied apart.
@@ -830,6 +840,9 @@ impl CopyInGate {
                 if let Some(raised) = (*held_at).and_then(|at| self.log.raise_hold(at, stamp)) {
                     *held_at = Some(raised);
                 }
+            }
+            if !published && self.held.load(Ordering::Relaxed) {
+                (self.tally.unanswered_after_holds).fetch_add(1, Ordering::Relaxed);
             }
             let since = since?;
             if !published {
