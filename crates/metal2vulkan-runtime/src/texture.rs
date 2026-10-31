@@ -397,6 +397,18 @@ impl ImagePlacement {
 #[derive(Clone)]
 pub struct Texture(Arc<TextureShared>);
 
+/// A texture held without keeping it ([`Texture::downgrade`]): it lives while the texture
+/// object does, until its last handle and the command buffers that hold it are gone.
+#[derive(Clone)]
+pub struct WeakTexture(Weak<TextureShared>);
+
+impl WeakTexture {
+    /// Whether the texture lives.
+    pub fn lives(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 pub(super) struct TextureShared {
     storage: Storage,
     /// What this texture presents of its image.
@@ -4154,6 +4166,11 @@ pub(super) enum IdUse {
 }
 
 impl Texture {
+    /// A handle that does not keep the texture ([`WeakTexture`]).
+    pub fn downgrade(&self) -> WeakTexture {
+        WeakTexture(Arc::downgrade(&self.0))
+    }
+
     /// A new texture object of `device` over `storage`, presenting `record`, a view of `parent`
     /// if any, with its resource ID as `id_use` says. A program's texture takes its ID's slot,
     /// and the device's texture table and heap sets hold it there (`heap_sets::place`).

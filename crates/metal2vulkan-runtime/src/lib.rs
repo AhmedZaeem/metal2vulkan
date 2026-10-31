@@ -342,7 +342,7 @@ pub use shader_cache::{
 pub use sparse::device::SparseFeatures;
 pub use sparse::encoder::ResourceStateCommandEncoder;
 pub use sparse::{SparsePageSize, SparseProblem, SparseTextureRegionAlignmentMode};
-pub use texture::{SharedTextureHandle, Texture, VkImageLayouts, WrappedImageProblem};
+pub use texture::{SharedTextureHandle, Texture, VkImageLayouts, WeakTexture, WrappedImageProblem};
 pub use texture_descriptor::{TextureDescriptor, TextureProblem, TextureSwizzleChannels};
 pub use used_resources::{EncoderKind, EndedEncoder, UsedResources};
 pub use values::{
