@@ -1138,6 +1138,7 @@ impl Texels {
             merge_scratch: ScratchSpares::default(),
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            shared: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1308,6 +1309,7 @@ impl Texels {
             merge_scratch: ScratchSpares::default(),
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            shared: std::sync::atomic::AtomicBool::new(false),
         };
         texels.staged = Some(Arc::new(copies));
         let (offset, alignment) = (
@@ -1381,6 +1383,14 @@ impl Texels {
             && (self.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some())
     }
 
+    /// What a home of these texels is shared by (`texture/homes.rs`): their buffer's bytes'
+    /// identity, and the offset, row pitch and texel size they lie at.
+    pub(super) fn home_parts(&self) -> (ResourceKey, u64, u64, u64) {
+        let layout = &self.layout;
+        let (bytes, _) = self.buffer.tracked(layout.offset..layout.end());
+        (bytes.key, layout.offset, layout.row_pitch, self.texel_bytes)
+    }
+
     /// Each condition of [`device_copy`](Self::device_copy), in words (a diagnostic).
     pub(super) fn device_copy_why(&self, device: &Device) -> String {
         let layout = &self.layout;
@@ -1390,7 +1400,8 @@ impl Texels {
             self.tracked(),
             layout.slices == 1,
             layout.shared_bytes() == 0,
-            (self.buffer.at_for(layout.offset, ReadApart::Texture).1).is_multiple_of(self.texel_bytes),
+            (self.buffer.at_for(layout.offset, ReadApart::Texture).1)
+                .is_multiple_of(self.texel_bytes),
             (self.buffer.host_pages()).is_some_and(|pages| pages.dirty().is_some()),
         )
     }
@@ -1452,6 +1463,7 @@ impl Texels {
             merge_scratch: ScratchSpares::default(),
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            shared: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

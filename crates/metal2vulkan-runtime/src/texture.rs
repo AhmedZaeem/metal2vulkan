@@ -162,6 +162,7 @@ pub(super) mod heap;
 pub(super) mod heap_tiled;
 pub(super) mod heap_two_planes;
 pub(crate) mod held_depth;
+mod homes;
 pub(crate) mod host_copy;
 pub(crate) mod host_shadow;
 mod in_place_image;
@@ -246,6 +247,8 @@ pub(super) struct TextureState {
     /// The multisampled depth textures held in the attachment layout between passes
     /// (`texture/held_depth.rs`).
     pub(crate) held: held_depth::HeldImages,
+    /// The live homes of textures over logged host pages (`texture/homes.rs`).
+    homes: homes::ShadowHomes,
 }
 
 impl TextureState {
@@ -288,6 +291,7 @@ impl TextureState {
             twin_decodes: twin_decode::TwinDecodes::default(),
             second_decodes: Mutex::new(Vec::new()),
             held: held_depth::HeldImages::default(),
+            homes: homes::ShadowHomes::default(),
         }
     }
 
@@ -2197,7 +2201,11 @@ impl Device {
             if texels_count >= 1 << 18 {
                 let line = format!(
                     "m2v no device copy {:?} {:?} rows {} usage {:?}: {}",
-                    plan.format, layout.extent, texels.layout.row_pitch, usage, texels.device_copy_why(self)
+                    plan.format,
+                    layout.extent,
+                    texels.layout.row_pitch,
+                    usage,
+                    texels.device_copy_why(self)
                 );
                 if let Ok(mut said) = SAID.lock() {
                     if said.len() < 300 && !said.contains(&line) {
@@ -2243,10 +2251,16 @@ impl Device {
                     };
                     // A render target over the pages renders in place where the device renders a
                     // linear image of its format as a color attachment (`in_place_rendering`).
-                    let renders_linear =
-                        facts.linear(plan.format).contains(FormatFeatureFlags2::COLOR_ATTACHMENT);
-                    match in_place::in_place_rendering(policy, usage, class, verdict, renders_linear)
-                    {
+                    let renders_linear = facts
+                        .linear(plan.format)
+                        .contains(FormatFeatureFlags2::COLOR_ATTACHMENT);
+                    match in_place::in_place_rendering(
+                        policy,
+                        usage,
+                        class,
+                        verdict,
+                        renders_linear,
+                    ) {
                         Ok(()) => {
                             match self.in_place_image(&plan, descriptor, &texels, class, &facts)? {
                                 Ok((image, pitched)) => {
@@ -2258,7 +2272,9 @@ impl Device {
                                 Err((refusal, why)) => {
                                     static SAID: std::sync::Mutex<Vec<String>> =
                                         std::sync::Mutex::new(Vec::new());
-                                    if u64::from(layout.extent[0]) * u64::from(layout.extent[1]) >= 1 << 18 {
+                                    if u64::from(layout.extent[0]) * u64::from(layout.extent[1])
+                                        >= 1 << 18
+                                    {
                                         let line = format!(
                                             "m2v in place refused ({refusal:?}) {:?} {:?} rows {} usage {:?}",
                                             plan.format, layout.extent, texels.layout.row_pitch, usage
@@ -2346,6 +2362,32 @@ impl Device {
         {
             return Err(Error::NotImplemented(RuntimeGap::Textures));
         }
+        // On a discrete GPU, a 2D color texture over logged host pages takes the live home of its
+        // bytes and layout whose image serves it: one image and its copies for every such
+        // texture (`texture/homes.rs`). A new home's image takes the usage a later one needs,
+        // where free.
+        let home = (texels.device_copy(self)
+            && !texels.buffer.detached()
+            && plan.image_type == metal2vulkan::vk::ImageType::TYPE_2D
+            && plan.levels == 1
+            && plan.layers == 1
+            && plan.samples == SampleCountFlags::COUNT_1
+            && texture_aspects(&plan) == vk::ImageAspectFlags::COLOR
+            && surface_depth_unit(layout.pixel_format).is_none())
+        .then(|| homes::HomeKey::of(&texels, &plan, texels.tracked()));
+        if let Some(key) = home {
+            if let Some(storage) = self.shared().textures.homes.take(key, &plan) {
+                self.shared().counts.shadow_home_taken();
+                if device_copy {
+                    self.shared().counts.device_copy_texture();
+                }
+                return Ok(storage);
+            }
+        }
+        let plan = match home {
+            Some(_) => self.widened_for_homes(plan, layout, usage, &facts)?,
+            None => plan,
+        };
         // Where the device copies a shadow back faster by a dispatch, the image takes the
         // integer view the dispatch reads (`shadow_copy_back.rs`).
         let (plan, word) = match shadow_copy_back::dispatches(self) {
@@ -2422,16 +2464,20 @@ impl Device {
         let copies = texels.shadow_copies(image.raw.get(), image.identity, aspects, views)?;
         // Its copies keep its own image, which it presents again once the bytes lie in pages.
         self.stand_in_while_detached(&texels.buffer, &image)?;
+        let (offset, bytes_per_row) = (texels.layout.offset, texels.layout.row_pitch);
+        let storage = Storage::Shadow {
+            image: image.shared(),
+            texels,
+            copies: Arc::new(copies),
+        };
+        if let Some(key) = home {
+            self.shared().textures.homes.offer(key, &storage);
+        }
         // A device copy degrades nothing: it holds the bytes wherever a command reads them.
         if device_copy {
             self.shared().counts.device_copy_texture();
-            return Ok(Storage::Shadow {
-                image: image.shared(),
-                texels,
-                copies: Arc::new(copies),
-            });
+            return Ok(storage);
         }
-        let (offset, bytes_per_row) = (texels.layout.offset, texels.layout.row_pitch);
         self.degrade(Degradation::ShadowedTexture, || {
             let format = descriptor.pixel_format;
             let [width, height, _] = layout.extent;
@@ -2442,11 +2488,33 @@ impl Device {
             (object, why)
         });
         self.shared().counts.shadowed_texture_made(aspects != every);
-        Ok(Storage::Shadow {
-            image: image.shared(),
-            texels,
-            copies: Arc::new(copies),
-        })
+        Ok(storage)
+    }
+
+    /// `plan`, a home's image's of a texture of `layout` and Metal `usage` (`texture/homes.rs`),
+    /// with the render target and sampled usage a texture that may take the home later needs,
+    /// where that keeps the image's format and costs it nothing ([`Device::if_free`]).
+    fn widened_for_homes(
+        &self,
+        plan: ImagePlan,
+        layout: &TextureLayout,
+        usage: TextureUsage,
+        facts: &ImageFacts<'_>,
+    ) -> Result<ImagePlan, Error> {
+        let wide = usage | TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+        if wide == usage {
+            return Ok(plan);
+        }
+        let Ok(candidate) = plan_image(layout, wide, false, facts) else {
+            return Ok(plan);
+        };
+        if candidate.format != plan.format
+            || candidate.flags != plan.flags
+            || !candidate.usage.contains(plan.usage)
+        {
+            return Ok(plan);
+        }
+        self.if_free(plan, candidate, layout.texture_type)
     }
 
     /// A tracked `Private` texture of `descriptor` whose image `plan` states, planned by the

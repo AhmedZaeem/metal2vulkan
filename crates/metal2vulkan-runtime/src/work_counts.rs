@@ -307,6 +307,7 @@ pub(crate) struct Counters {
     shadows_over_fresh_pages: AtomicU64,
     host_textures_in_place: AtomicU64,
     device_copy_textures: AtomicU64,
+    shadow_homes_taken: AtomicU64,
     dma_buf_textures_in_place: AtomicU64,
     fresh_page_textures_in_place: AtomicU64,
     pitched_host_images: AtomicU64,
@@ -2131,6 +2132,11 @@ impl Counters {
     /// A texture over host pages was made a device copy of them (`texture.rs`).
     pub(crate) fn device_copy_texture(&self) {
         self.device_copy_textures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A texture over logged host pages took a live home's image (`texture/homes.rs`).
+    pub(crate) fn shadow_home_taken(&self) {
+        self.shadow_homes_taken.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A texture over host pages of `class` was made an image in place over them (`in_place.rs`),
@@ -4397,6 +4403,11 @@ pub struct WorkCounts {
     /// (`HostMemory::with_dirty_pages`): a shadow whose copies in take only the rows the log
     /// reports changed (`dirty_copies_in_gated` and kin), announced nowhere.
     pub device_copy_textures: u64,
+    /// Textures over logged host pages on a discrete GPU (device copies, and shadows that render)
+    /// that took the live home of their bytes and layout instead of a shadow image of their own
+    /// (`texture/homes.rs`): one device-local image, its copies and its log's hold, for every such
+    /// texture, so what one renders the others sample in the device's memory.
+    pub shadow_homes_taken: u64,
     /// Of `host_textures_in_place`, those over pages imported as dma-bufs: each a
     /// `DRM_FORMAT_MOD_LINEAR` image over a dma-buf of its own pages (also counted in
     /// `dma_buf_images`).
@@ -4616,6 +4627,10 @@ pub struct WorkCounts {
     pub dirty_copies_in_whole: u64,
     /// Of those, the ones that copied nothing: no page changed.
     pub dirty_copies_in_skipped: u64,
+    /// Of those, the ones over a home more than one texture took (`shadow_homes_taken`): a
+    /// texture's copy in the home's own holding made needless, the image holding what another
+    /// texture over the bytes rendered or copied in.
+    pub dirty_copies_in_skipped_in_shared_homes: u64,
     /// The bytes the gated copies in would have moved copying every region.
     pub dirty_copy_in_bytes_whole: u64,
     /// The bytes the gated copies in moved.
@@ -5420,6 +5435,7 @@ impl Device {
             shadows_over_fresh_pages: counters.shadows_over_fresh_pages.load(Ordering::Relaxed),
             host_textures_in_place: counters.host_textures_in_place.load(Ordering::Relaxed),
             device_copy_textures: counters.device_copy_textures.load(Ordering::Relaxed),
+            shadow_homes_taken: counters.shadow_homes_taken.load(Ordering::Relaxed),
             dma_buf_textures_in_place: counters.dma_buf_textures_in_place.load(Ordering::Relaxed),
             fresh_page_textures_in_place: counters
                 .fresh_page_textures_in_place
@@ -5578,6 +5594,7 @@ impl Device {
             dirty_copies_in_gated: dirty.gated.load(Ordering::Relaxed),
             dirty_copies_in_whole: dirty.whole.load(Ordering::Relaxed),
             dirty_copies_in_skipped: dirty.skipped.load(Ordering::Relaxed),
+            dirty_copies_in_skipped_in_shared_homes: dirty.skipped_shared.load(Ordering::Relaxed),
             dirty_copy_in_bytes_whole: dirty.bytes_whole.load(Ordering::Relaxed),
             dirty_copy_in_bytes_copied: dirty.bytes_copied.load(Ordering::Relaxed),
             dirty_stamps_asked: dirty.stamps.load(Ordering::Relaxed),

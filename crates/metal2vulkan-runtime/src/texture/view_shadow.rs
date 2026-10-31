@@ -483,6 +483,7 @@ impl Device {
                     merge_scratch: ScratchSpares::default(),
                     touched: AtomicU64::new(0),
                     stood: AtomicU64::new(0),
+                    shared: std::sync::atomic::AtomicBool::new(false),
                 };
                 Owner::ViewShadow(Box::new(ViewShadow {
                     placement,

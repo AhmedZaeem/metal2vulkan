@@ -216,6 +216,10 @@ pub(super) struct ShadowCopies {
     /// serve is counted as one an earlier command buffer's standing stands behind, or as one of a
     /// shadow that never held a standing ([`CarryTally`]).
     pub(super) stood: AtomicU64,
+    /// More than one texture took it as their home (`texture/homes.rs`), by which its gated
+    /// copies in that copy nothing are counted apart
+    /// (`WorkCounts::dirty_copies_in_skipped_in_shared_homes`).
+    pub(super) shared: std::sync::atomic::AtomicBool,
 }
 
 /// The texels of a texture over an IOSurface's plane from which its shadow's copies in count

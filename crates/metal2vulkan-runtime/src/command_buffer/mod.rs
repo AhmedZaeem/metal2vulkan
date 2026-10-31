@@ -2735,8 +2735,8 @@ impl CommandBuffer {
                     (None, Some(carry)) => carry.held_whole(),
                     _ => Vec::new(),
                 };
-                let dirty = lock(&self.0.dirty);
-                device.shared().dirty.stamped(&dirty);
+                let mut dirty = lock(&self.0.dirty);
+                device.shared().dirty.stamped(&mut dirty, &held);
                 if let (true, Some(replays)) = (dirty.gated(), &state.replays) {
                     replays.defer();
                 }

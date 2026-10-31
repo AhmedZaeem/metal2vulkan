@@ -171,6 +171,7 @@ impl Texture {
                 merge_scratch: ScratchSpares::default(),
                 touched: AtomicU64::new(0),
                 stood: AtomicU64::new(0),
+                shared: std::sync::atomic::AtomicBool::new(false),
             };
             let storage = Storage::Shadow {
                 image: image.shared(),

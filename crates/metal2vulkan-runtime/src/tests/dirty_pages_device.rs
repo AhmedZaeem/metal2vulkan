@@ -38,6 +38,12 @@
 //! changed (nothing); a stamp the log never publishes within the hold goes at its end, every row
 //! (`WorkCounts::heads_held_for_dirty_publications`).
 //!
+//! A texture that renders and one that samples over the same logged bytes, laid out alike, at rows
+//! no linear image of the device takes (320 bytes for 64 texels), share one home
+//! (`texture/homes.rs`, `WorkCounts::shadow_homes_taken`): what the pass draws, the kernel reads
+//! through the other texture with no copy in (`dirty_copies_in_skipped_in_shared_homes`), a CPU
+//! write the log tells reaches both, and the home outlives the texture that made it.
+//!
 //! A render target over such pages, loaded by a pass whose draws' scissor bounds them to rows 0
 //! to 8, copies in every texel the first time and then only the rows the log reports changed: its
 //! copy in is not cut to the scissor, so the image holds every texel for the next command buffer,
@@ -714,6 +720,116 @@ fn a_held_command_buffer_waits_for_its_stamp_and_holds_back_no_other_queue() {
     eprintln!("DIRTY-PAGES: hold frame 3 (never published) {third:?}");
     assert_eq!(third[1], 1, "every row at the hold's end");
     drop(source);
+    drop(buffer);
+    drop(device);
+}
+
+/// One pass over `target` that loads it and draws `color` over rows 0 to 8 of its 64 columns.
+fn draw_rows(device: &Device, target: &Texture, color: [f32; 4]) {
+    draw_in_scissor(device, target, color);
+}
+
+#[test]
+fn textures_over_the_same_logged_bytes_share_one_home() {
+    const PITCH: u64 = 320;
+    let scratch = Scratch::new("dirty-pages-homes");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1010_1010);
+    let homes = || device.work_counts().shadow_homes_taken;
+    let taken = homes();
+    let mut rendered = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    rendered.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+    let producer = buffer.new_texture(&rendered, 0, PITCH).unwrap();
+    let mut sampled = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    sampled.usage = TextureUsage::SHADER_READ;
+    let reader = buffer.new_texture(&sampled, 0, PITCH).unwrap();
+    let took = homes() - taken;
+    eprintln!("DIRTY-PAGES: homes taken {took}");
+    if took == 0 {
+        eprintln!("DIRTY-PAGES: no home (an integrated GPU, or rows a linear image takes)");
+        return;
+    }
+    assert_eq!(took, 1, "the second texture takes the first's home");
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    let bytes = buffer.contents().unwrap().as_ptr();
+    let shared_skips = || device.work_counts().dirty_copies_in_skipped_in_shared_homes;
+
+    // Frame 1: the pass draws rows 0 to 8 red; the kernel reads them through the reader.
+    draw_rows(&device, &producer, [1.0, 0.0, 0.0, 1.0]);
+    let (before, skips) = (counts(&device), shared_skips());
+    run(&device, &invert, &reader, &target);
+    let first = delta(&device, before);
+    eprintln!(
+        "DIRTY-PAGES: homes frame 1 read {first:?}, skips in shared homes {}",
+        shared_skips() - skips
+    );
+    assert_eq!(
+        texel(&target, 0),
+        [0, 255, 255, 255],
+        "the reader sees the pass's red"
+    );
+    assert_eq!(
+        texel(&target, 20),
+        [0xef, 0xef, 0xef, 0x10],
+        "and the pages' bytes elsewhere"
+    );
+    assert_eq!(
+        first[2], 1,
+        "the read copies nothing in: the home holds the pass's texels"
+    );
+    assert_eq!(
+        shared_skips() - skips,
+        1,
+        "counted as a skip in a shared home"
+    );
+
+    // Frame 2: the CPU writes row 40, told to the log; the pass draws green; the reader sees both.
+    // SAFETY: a row of the buffer's first bytes, which no command uses now.
+    unsafe { std::ptr::write_bytes(bytes.add((40 * PITCH) as usize), 0x40, (SIDE * 4) as usize) };
+    log.told(40 * PITCH..41 * PITCH, 0);
+    draw_rows(&device, &producer, [0.0, 1.0, 0.0, 1.0]);
+    let before = counts(&device);
+    run(&device, &invert, &reader, &target);
+    let second = delta(&device, before);
+    eprintln!("DIRTY-PAGES: homes frame 2 read {second:?}");
+    assert_eq!(texel(&target, 0), [255, 0, 255, 255], "the pass's green");
+    assert_eq!(
+        texel(&target, 40),
+        [0xbf, 0xbf, 0xbf, 0x40],
+        "the CPU's row"
+    );
+    assert_eq!(
+        second[2], 1,
+        "the pass's copy in took the CPU's row: the read copies nothing"
+    );
+
+    // The home outlives the texture that made it: the reader still reads the pages' texels.
+    drop(producer);
+    // SAFETY: as above.
+    unsafe { std::ptr::write_bytes(bytes.add((50 * PITCH) as usize), 0x50, (SIDE * 4) as usize) };
+    log.told(50 * PITCH..51 * PITCH, 0);
+    run(&device, &invert, &reader, &target);
+    assert_eq!(
+        texel(&target, 50),
+        [0xaf, 0xaf, 0xaf, 0x50],
+        "the CPU's row, after the first went"
+    );
+    assert_eq!(
+        texel(&target, 0),
+        [255, 0, 255, 255],
+        "and the pass's green still"
+    );
+    drop(reader);
     drop(buffer);
     drop(device);
 }

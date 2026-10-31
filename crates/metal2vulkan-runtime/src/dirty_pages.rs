@@ -386,6 +386,7 @@ pub(crate) struct DirtyTally {
     pub(crate) gated: AtomicU64,
     pub(crate) whole: AtomicU64,
     pub(crate) skipped: AtomicU64,
+    pub(crate) skipped_shared: AtomicU64,
     pub(crate) bytes_whole: AtomicU64,
     pub(crate) bytes_copied: AtomicU64,
     pub(crate) stamps: AtomicU64,
@@ -492,24 +493,34 @@ impl DirtyShadows {
     /// A committed command buffer's `commit` ([`DirtyCommit`]), at its commit: a stamp of each
     /// source its gated copies in read, one per source, asked now, so every CPU write made before
     /// the commit, which Metal shows the command buffer, is in the publication its copies in wait
-    /// for ([`planned`](Self::planned) decides what they copy); and its copies back and merges,
-    /// reported ([`DirtyPages::wrote_as`]) before any stamp a later commit asks.
-    pub(crate) fn stamped(&self, commit: &DirtyCommit) {
+    /// for ([`planned`](Self::planned) decides what they copy); a stamp too for the logs of the
+    /// shadows its end left holding every texel of their truth (`held`) with no gated copy in
+    /// (a pass that cleared every texel), so their holds count from the commit on; and its copies
+    /// back and merges, reported ([`DirtyPages::wrote_as`]) before any stamp a later commit asks.
+    pub(crate) fn stamped(&self, commit: &mut DirtyCommit, held: &[Arc<ShadowCopies>]) {
         for (log, range) in &commit.wrote {
             log.wrote_back(range.clone());
         }
         let mut stamps: Vec<(Arc<DirtySource>, DirtyStamp)> = Vec::new();
+        let mut stamp_of = |source: &Arc<DirtySource>| match (stamps.iter())
+            .find(|(s, _)| Arc::ptr_eq(s, source))
+        {
+            Some((_, stamp)) => *stamp,
+            None => {
+                let stamp = source.request(&self.tally);
+                stamps.push((Arc::clone(source), stamp));
+                stamp
+            }
+        };
         for gate in &commit.gates {
-            let source = &gate.log.source;
-            let stamp = match stamps.iter().find(|(s, _)| Arc::ptr_eq(s, source)) {
-                Some((_, stamp)) => *stamp,
-                None => {
-                    let stamp = source.request(&self.tally);
-                    stamps.push((Arc::clone(source), stamp));
-                    stamp
-                }
-            };
-            *lock(&gate.stamp) = Some(stamp);
+            *lock(&gate.stamp) = Some(stamp_of(&gate.log.source));
+        }
+        for copies in held {
+            let gated = (commit.gates.iter()).any(|gate| gate.of(copies));
+            if let (false, Some(log)) = (gated, self.kept(copies)) {
+                let stamp = stamp_of(&log.source);
+                commit.held_logs.push((log, stamp));
+            }
         }
     }
 
@@ -577,6 +588,7 @@ impl DirtyShadows {
         if split {
             return;
         }
+        synced.append(&mut commit.held_logs);
         for (log, stamp) in synced {
             let holds = log
                 .copies
@@ -598,6 +610,9 @@ pub(crate) struct DirtyCommit {
     gates: Vec<Arc<CopyInGate>>,
     wrote: Vec<(Arc<ShadowLog>, Range<u64>)>,
     unsettling: Vec<Arc<ShadowLog>>,
+    /// The logs of the shadows its end held whole with no gated copy in, and their stamps
+    /// ([`DirtyShadows::stamped`]).
+    held_logs: Vec<(Arc<ShadowLog>, DirtyStamp)>,
 }
 
 /// The most writes a command buffer keeps apart, past which they are one write of everything.
@@ -683,6 +698,11 @@ const ROW_GAP: u32 = 8;
 const REGIONS: usize = 1024;
 
 impl CopyInGate {
+    /// Whether it gates a copy in of `copies`.
+    fn of(&self, copies: &Arc<ShadowCopies>) -> bool {
+        std::ptr::eq(self.log.copies.as_ptr(), Arc::as_ptr(copies))
+    }
+
     /// The regions of `whole` to copy now, into `out`, counted: `whole` itself where the decision
     /// holds no stamp, the wait cannot say, or the rows changed come to half the rows or more;
     /// none where no page changed.
@@ -698,6 +718,11 @@ impl CopyInGate {
         tally.bytes_copied.fetch_add(copied, Ordering::Relaxed);
         if out.is_empty() {
             tally.skipped.fetch_add(1, Ordering::Relaxed);
+            let shared = (self.log.copies.upgrade())
+                .is_some_and(|copies| copies.shared.load(Ordering::Relaxed));
+            if shared {
+                tally.skipped_shared.fetch_add(1, Ordering::Relaxed);
+            }
         } else if copied == total {
             tally.whole.fetch_add(1, Ordering::Relaxed);
         }

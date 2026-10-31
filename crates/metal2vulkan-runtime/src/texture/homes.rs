@@ -1,0 +1,140 @@
+//! Homes: on a discrete GPU, one device-local image for every texture over the same bytes of host
+//! pages whose memory carries a log of its writes (`HostMemory::with_dirty_pages`), laid out alike.
+//!
+//! Such a texture is a shadow of the bytes in the device's memory (a device copy, or a shadow that
+//! renders), whose copies in the log gates (`dirty_pages.rs`). Without homes each texture over the
+//! bytes is a shadow of its own: a pass rendering into one merges its texels back into the pages,
+//! a GPU write the log does not show, so every other texture's next copy in reads the rows back
+//! across the bus, once per frame and texture. With a home, a texture made over the same bytes,
+//! of the same buffer, at the same offset, rows and texel size, extent and tracking, whose image
+//! the home's serves (format, or a format the home's image is viewed as, usage and creation flags
+//! within the home's), takes the home's image, texels and copies (`Storage::Shadow`, each shared):
+//! one image, one log and one hold, one resource to the tracker. What one texture renders, the
+//! others sample in place in the device's memory; the merge back into the pages stays, as Metal
+//! shows the CPU what the GPU wrote.
+//!
+//! - **The texels are the truth's, as before.** Every texture over the home presents the same
+//!   bytes of the same buffer, laid out alike, so a write through any of them is a write through
+//!   the shadow they share, and its copies in, keeps and merges are the shadow's: nothing the
+//!   texture's own shadow would have done differs but the images there are no more of.
+//! - **Made as wide as is free.** A home's image takes the render target and sampled usage a
+//!   texture that may take it later needs, where that costs the image nothing and keeps its
+//!   format (`Device::if_free`), so a texture that renders can take a home a sampled texture
+//!   made, and the other way.
+//! - **Held weakly.** The registry holds a home's parts weakly: the home goes with the last
+//!   texture over it.
+//!
+//! Counted: `WorkCounts::shadow_homes_taken`, and of the gated copies in, those that copied
+//! nothing over a home more than one texture took (`dirty_copies_in_skipped_in_shared_homes`).
+
+use super::{Image, ImagePlan, Storage};
+use crate::buffer_texture::Texels;
+use crate::device::lock;
+use crate::resource::ResourceKey;
+use crate::shadow::ShadowCopies;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, Weak};
+
+/// What a texture over logged pages shares a home by: its buffer's bytes' identity, the offset,
+/// rows and texel size its texels lie at, its extent, and whether it is tracked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HomeKey {
+    buffer: ResourceKey,
+    offset: u64,
+    row_pitch: u64,
+    texel: u64,
+    extent: [u32; 3],
+    tracked: bool,
+}
+
+impl HomeKey {
+    /// The key of a texture laid out as `plan` over `texels`, `extent` texels wide, high and deep.
+    pub(super) fn of(texels: &Texels, plan: &ImagePlan, tracked: bool) -> HomeKey {
+        let (buffer, offset, row_pitch, texel) = texels.home_parts();
+        HomeKey {
+            buffer,
+            offset,
+            row_pitch,
+            texel,
+            extent: plan.extent,
+            tracked,
+        }
+    }
+}
+
+/// One home: its image, texels and copies, held weakly.
+struct Home {
+    key: HomeKey,
+    image: Weak<Image>,
+    texels: Weak<Texels>,
+    copies: Weak<ShadowCopies>,
+}
+
+/// The device's live homes.
+#[derive(Default)]
+pub(super) struct ShadowHomes {
+    homes: Mutex<Vec<Home>>,
+}
+
+/// The most homes the registry keeps: past them a texture's shadow is its own.
+const HOMES: usize = 256;
+
+impl ShadowHomes {
+    /// The storage of a live home of `key` whose image serves a texture planned as `plan`, marked
+    /// shared; `None` where none does.
+    pub(super) fn take(&self, key: HomeKey, plan: &ImagePlan) -> Option<Storage> {
+        let mut homes = lock(&self.homes);
+        homes.retain(|home| home.copies.strong_count() > 0);
+        (homes.iter())
+            .filter(|home| home.key == key)
+            .find_map(|home| {
+                let image = home.image.upgrade()?;
+                let texels = home.texels.upgrade()?;
+                let copies = home.copies.upgrade()?;
+                if !serves(image.plan(), plan) {
+                    return None;
+                }
+                copies.shared.store(true, Ordering::Relaxed);
+                Some(Storage::Shadow {
+                    image,
+                    texels,
+                    copies,
+                })
+            })
+    }
+
+    /// `storage`, a shadow just made over logged pages, as the home of `key`.
+    pub(super) fn offer(&self, key: HomeKey, storage: &Storage) {
+        let Storage::Shadow {
+            image,
+            texels,
+            copies,
+        } = storage
+        else {
+            return;
+        };
+        let mut homes = lock(&self.homes);
+        homes.retain(|home| home.copies.strong_count() > 0);
+        if homes.len() < HOMES {
+            homes.push(Home {
+                key,
+                image: Arc::downgrade(image),
+                texels: Arc::downgrade(texels),
+                copies: Arc::downgrade(copies),
+            });
+        }
+    }
+}
+
+/// Whether a home's image of `home` serves a texture whose own image would be `plan`: of its shape,
+/// its format or one the home's image is viewed as, and usage and creation flags within the home's.
+fn serves(home: &ImagePlan, plan: &ImagePlan) -> bool {
+    home.image_type == plan.image_type
+        && home.extent == plan.extent
+        && home.levels == plan.levels
+        && home.layers == plan.layers
+        && home.samples == plan.samples
+        && home.usage.contains(plan.usage)
+        && home.flags.contains(plan.flags)
+        && (home.format == plan.format || home.view_formats.contains(&plan.format))
+}

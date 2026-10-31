@@ -236,8 +236,11 @@ the runtime made.
   (`HostMemory::with_dirty_pages`), tracked and laid out as one copy, is instead such a copy in
   the device's memory, announced nowhere, whatever the check answered: its copies in take only the
   rows the log reports changed, so the GPU reads the surface from its own memory, where in place it
-  reads the pages across the bus at every sample (`WorkCounts::device_copy_textures`). Exact either
-  way; integrated GPUs, CPU devices and memory without a log keep the image in place.
+  reads the pages across the bus at every sample (`WorkCounts::device_copy_textures`). Textures over
+  the same bytes of one buffer, laid out alike, share one such copy, a texture that renders among
+  them, so what one renders the others sample in the device's memory
+  (`WorkCounts::shadow_homes_taken`). Exact either way; integrated GPUs, CPU devices and memory
+  without a log keep the image in place.
 - **Two-plane YCbCr textures** (`YCBCR8_420_2P` and its kin over a surface's planes) hold an
   image of the texels Metal reads, converted from the planes before a command buffer's first use
   where they changed. Where `has_unified_memory`, a function that only samples a `YCBCR8_420_2P`

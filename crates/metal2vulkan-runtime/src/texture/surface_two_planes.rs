@@ -240,6 +240,7 @@ impl Device {
             merge_scratch: ScratchSpares::default(),
             touched: AtomicU64::new(0),
             stood: AtomicU64::new(0),
+            shared: std::sync::atomic::AtomicBool::new(false),
         };
         self.degrade(Degradation::ShadowedTexture, || {
             let [width, height, _] = layout.extent;

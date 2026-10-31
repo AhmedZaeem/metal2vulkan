@@ -300,7 +300,9 @@ buffer whose memory carries a log of its writes (`HostMemory::with_dirty_pages`)
 slice laid out as one copy, is instead a device copy (`WorkCounts::device_copy_textures`, whatever
 the check answered): a shadow whose copies in take only the bands of rows the log reports changed
 (`dirty_copies_in_gated` and kin). Its notice is not announced: it holds the bytes wherever a
-command reads it.
+command reads it. Textures over the same bytes of one buffer, laid out alike, share one device copy
+(a texture that renders over them among them), so what one renders the others sample with no copy
+in (`WorkCounts::shadow_homes_taken`, `dirty_copies_in_skipped_in_shared_homes`).
 A texture placed in a heap over dma-buf pages is an image over a dma-buf of its own pages, which its
 first submission acquires from `VK_QUEUE_FAMILY_FOREIGN_EXT`; a linear image over a buffer of the
 runtime's own memory starts `VK_IMAGE_LAYOUT_PREINITIALIZED`, and its move from there keeps its
