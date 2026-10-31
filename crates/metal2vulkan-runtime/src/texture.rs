@@ -2493,7 +2493,11 @@ impl Device {
 
     /// `plan`, a home's image's of a texture of `layout` and Metal `usage` (`texture/homes.rs`),
     /// with the render target and sampled usage a texture that may take the home later needs,
-    /// where that keeps the image's format and costs it nothing ([`Device::if_free`]).
+    /// where that keeps the image's format and costs it nothing ([`Device::if_free`]): the plan of
+    /// the wider Metal usage where it keeps the format, its flags and views a superset; else the
+    /// Vulkan usage itself, where the format's optimal tiling takes it. A home an sRGB render
+    /// target made would otherwise lack the sampled usage every texture that samples the surface
+    /// in its `Unorm` view needs (measured: the iOS Simulator's screen under reims-vgpu).
     fn widened_for_homes(
         &self,
         plan: ImagePlan,
@@ -2502,16 +2506,27 @@ impl Device {
         facts: &ImageFacts<'_>,
     ) -> Result<ImagePlan, Error> {
         let wide = usage | TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
-        if wide == usage {
-            return Ok(plan);
+        let planned = (wide != usage)
+            .then(|| plan_image(layout, wide, false, facts).ok())
+            .flatten()
+            .filter(|candidate| {
+                candidate.format == plan.format
+                    && candidate.flags.contains(plan.flags)
+                    && candidate.usage.contains(plan.usage)
+                    && plan
+                        .view_formats
+                        .iter()
+                        .all(|f| candidate.view_formats.contains(f))
+            });
+        let mut candidate = planned.unwrap_or_else(|| plan.clone());
+        let features = facts.optimal(plan.format);
+        if features.contains(FormatFeatureFlags2::SAMPLED_IMAGE) {
+            candidate.usage |= ImageUsageFlags::SAMPLED;
         }
-        let Ok(candidate) = plan_image(layout, wide, false, facts) else {
-            return Ok(plan);
-        };
-        if candidate.format != plan.format
-            || candidate.flags != plan.flags
-            || !candidate.usage.contains(plan.usage)
-        {
+        if features.contains(FormatFeatureFlags2::COLOR_ATTACHMENT) {
+            candidate.usage |= ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if candidate.usage == plan.usage && candidate.flags == plan.flags {
             return Ok(plan);
         }
         self.if_free(plan, candidate, layout.texture_type)

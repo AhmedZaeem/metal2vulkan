@@ -51,7 +51,9 @@
 //! no linear image of the device takes (320 bytes for 64 texels), share one home
 //! (`texture/homes.rs`, `WorkCounts::shadow_homes_taken`): what the pass draws, the kernel reads
 //! through the other texture with no copy in (`dirty_copies_in_skipped_in_shared_homes`), a CPU
-//! write the log tells reaches both, and the home outlives the texture that made it.
+//! write the log tells reaches both, and the home outlives the texture that made it. A home an
+//! sRGB render target made takes a sampled `Unorm` texture over the same bytes too: its image
+//! takes the sampled usage that texture needs, where free (the iOS Simulator's screen).
 //!
 //! A render target over such pages, loaded by a pass whose draws' scissor bounds them to rows 0
 //! to 8, copies in every texel the first time and then only the rows the log reports changed: its
@@ -1050,6 +1052,53 @@ fn an_unused_shadow_lets_go_of_its_watch_and_its_hold() {
     );
     assert_eq!(texel(&target, 10), [0xef, 0xef, 0xef, 0x10]);
     drop(source);
+    drop(buffer);
+    drop(device);
+}
+
+#[test]
+fn a_home_an_srgb_render_target_made_takes_a_sampled_texture() {
+    const PITCH: u64 = 320;
+    let scratch = Scratch::new("dirty-pages-srgb-home");
+    let host = Host::new();
+    let device = device(&scratch.0);
+    eprintln!("DIRTY-PAGES: device {:?}", device.name());
+    let log = Arc::new(Log::default());
+    let Some(buffer) = over_logged(&device, &host, &log) else {
+        return;
+    };
+    host.fill(0x1020_3040);
+    let homes = || device.work_counts().shadow_homes_taken;
+    let taken = homes();
+    let mut rendered =
+        TextureDescriptor::texture_2d(PixelFormat::BGRA8UnormSRGB, SIDE, SIDE, false);
+    rendered.usage = TextureUsage::RENDER_TARGET;
+    let producer = buffer.new_texture(&rendered, 0, PITCH).unwrap();
+    let mut sampled = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, SIDE, SIDE, false);
+    sampled.usage = TextureUsage::SHADER_READ;
+    let reader = buffer.new_texture(&sampled, 0, PITCH).unwrap();
+    let took = homes() - taken;
+    eprintln!("DIRTY-PAGES: srgb homes taken {took}");
+    if device.work_counts().device_copy_textures == 0 {
+        eprintln!("DIRTY-PAGES: no device copies (an integrated GPU)");
+        return;
+    }
+    assert_eq!(
+        took, 1,
+        "the sampled texture takes the sRGB render target's home"
+    );
+    let mut plain = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, SIDE, SIDE, false);
+    plain.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
+    plain.resource_options = ResourceOptions::shared();
+    let target = device.new_texture(&plain).unwrap();
+    let invert = state(&device, "invert_texels");
+    run(&device, &invert, &reader, &target);
+    assert_eq!(
+        texel(&target, 7),
+        [0xbf, 0xcf, 0xdf, 0x10],
+        "the reader reads the pages' texels through the home"
+    );
+    drop((producer, reader));
     drop(buffer);
     drop(device);
 }
