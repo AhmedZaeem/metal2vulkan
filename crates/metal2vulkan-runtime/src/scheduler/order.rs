@@ -19,6 +19,19 @@
 //!   semaphore whose signal is not yet submitted. That one and those after it wait for the
 //!   program's signal, as Metal schedules them after it, so a later commit may go first: Metal
 //!   follows the event.
+//! - **A short line passes a burst.** A head whose line holds at most [`SHORT_LINE`] batches
+//!   goes before the ready heads committed before it where one of their lines holds
+//!   [`PASSED_TIMES`] times as many, and at least [`SHORT_LINE`]: a queue that submits a frame at
+//!   a time then waits for none of another queue's burst of command buffers, each of which costs
+//!   the scheduler's thread its planning and submission. It goes only where it is not
+//!   [`behind`](Order::is_behind) an earlier batch: ready batches keep their place, so a passing
+//!   head that conflicts with one waits for it, and tracked order across queues stays commit
+//!   order. Without such a line every head goes in commit order, as before, and none is asked
+//!   whether it is behind for this. Measured (a macOS guest on an RTX A5000 Laptop, NVIDIA
+//!   615.78.08): with the iOS Simulator committing about 1,500 command buffers a second, in
+//!   bursts of about 60, WindowServer's commits waited for submission 11 ms at the 90th
+//!   percentile and 36 ms at worst, 58 to 62 of the Simulator's going first, where idle they
+//!   waited 0.2 ms.
 //! - **No deadlock.** A head waits behind batches committed before it that keep their place
 //!   only; the first of those waits for no batch but its line's earlier ones, or for the runtime
 //!   (a host step's gate or pipelines, its checks), which never waits for a later commit.
@@ -50,6 +63,13 @@ use std::collections::{BTreeMap, VecDeque};
 const SPARE_LINES: usize = 4;
 const SPARE_ROOM: usize = 64;
 
+/// The most batches a line may hold for its head to pass ready heads committed before it
+/// ([`next`](Order::next)): a queue that submits a frame's few command buffers at a time.
+const SHORT_LINE: usize = 8;
+/// How many times as many batches, and at least [`SHORT_LINE`], a line with a head committed
+/// before a short line's head holds for that head to pass it: a burst of another queue's.
+const PASSED_TIMES: usize = 4;
+
 /// The committed batches not yet submitted, by logical queue.
 #[derive(Debug)]
 pub(crate) struct Order<B> {
@@ -61,6 +81,8 @@ pub(crate) struct Order<B> {
     spare: Vec<VecDeque<(u64, B)>>,
     /// The heads [`next`](Order::next) orders, by commit sequence number and line.
     heads: Vec<(u64, usize)>,
+    /// Of each of `heads`, whether it is a short line's that may pass the heads before it.
+    passing: Vec<bool>,
 }
 
 impl<B> Default for Order<B> {
@@ -70,6 +92,7 @@ impl<B> Default for Order<B> {
             next: 0,
             spare: Vec::new(),
             heads: Vec::new(),
+            passing: Vec::new(),
         }
     }
 }
@@ -217,37 +240,58 @@ impl<B> Order<B> {
     /// Take the batch to submit next: of the line heads that `ready` prepares and that are not
     /// `behind` (asked of those, in commit order, until one goes), the one committed first, with
     /// its line's queue, its commit sequence number (for [`put_back`](Self::put_back)) and what
-    /// `ready` made of it. `None` when no head is ready.
+    /// `ready` made of it; but a passing head, a short line's (the module docs), goes before the
+    /// heads committed before it, asked first. `None` when no head is ready.
     ///
     /// `ready` takes each head it looks at mutably, so a caller may note on a head it holds back
     /// why it did (`scheduler/mod.rs`'s [`HeldFor`](crate::scheduler::HeldFor)); it is asked of
-    /// each head in commit order until one is both ready and not `behind`.
+    /// the passing heads, then of the others, each in commit order, until one is both ready and
+    /// not `behind`.
     pub(crate) fn next<T>(
         &mut self,
         mut behind: impl FnMut(&Self, u64) -> bool,
         mut ready: impl FnMut(&mut B) -> Option<T>,
     ) -> Option<(u64, u64, B, T)> {
-        let Order { lines, heads, .. } = self;
+        let Order {
+            lines,
+            heads,
+            passing,
+            ..
+        } = self;
         heads.clear();
         heads.extend(
             (lines.iter().enumerate())
                 .filter_map(|(at, (_, line))| line.front().map(|(sequence, _)| (*sequence, at))),
         );
         heads.sort_unstable();
+        // A short line's head may pass the heads committed before it where one of their lines
+        // holds many times as many batches (the module docs).
+        passing.clear();
+        let mut longest = 0;
+        for &(_, at) in heads.iter() {
+            let held = lines[at].1.len();
+            passing.push(held <= SHORT_LINE && longest >= SHORT_LINE.max(PASSED_TIMES * held));
+            longest = longest.max(held);
+        }
         let mut found = None;
-        for index in 0..self.heads.len() {
-            let (sequence, at) = self.heads[index];
-            let Some((_, head)) = self.lines[at].1.front_mut() else {
-                continue;
-            };
-            let Some(prepared) = ready(head) else {
-                continue;
-            };
-            if behind(self, sequence) {
-                continue;
+        'look: for passes in [true, false] {
+            for index in 0..self.heads.len() {
+                if self.passing[index] != passes {
+                    continue;
+                }
+                let (sequence, at) = self.heads[index];
+                let Some((_, head)) = self.lines[at].1.front_mut() else {
+                    continue;
+                };
+                let Some(prepared) = ready(head) else {
+                    continue;
+                };
+                if behind(self, sequence) {
+                    continue;
+                }
+                found = Some((at, prepared));
+                break 'look;
             }
-            found = Some((at, prepared));
-            break;
         }
         let (at, prepared) = found?;
         let queue = self.lines[at].0;

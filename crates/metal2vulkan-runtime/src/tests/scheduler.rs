@@ -841,3 +841,42 @@ fn a_thread_about_to_block_drains_the_lines_in_commit_order() {
     assert!(order.is_empty());
     assert_eq!(take_first(&mut order), None);
 }
+
+/// The names `take` gives until it gives none.
+fn drain(order: &mut Order<Work>) -> String {
+    std::iter::from_fn(|| take(order)).collect()
+}
+
+/// A short line's head passes another queue's burst committed before it, where it touches nothing
+/// of it (`order.rs`, "A short line passes a burst"); the burst then goes in commit order.
+#[test]
+fn a_short_line_passes_another_queues_burst() {
+    let mut order = Order::default();
+    order.push(1, (0..10).map(|_| work('s', &[1], &[2])));
+    order.push(2, [work('e', &[3], &[4])]);
+    assert_eq!(drain(&mut order), "essssssssss");
+}
+
+/// A short line's head that reads what a burst before it writes waits for every batch of it it
+/// conflicts with: tracked order across queues stays commit order.
+#[test]
+fn a_short_line_that_conflicts_waits_for_the_burst() {
+    let mut order = Order::default();
+    order.push(1, (0..10).map(|_| work('s', &[], &[2])));
+    order.push(2, [work('e', &[2], &[])]);
+    assert_eq!(drain(&mut order), "sssssssssse");
+}
+
+/// A line passes only a line committed before it of four times as many batches, and at least
+/// eight: two pass eight, three do not.
+#[test]
+fn a_line_passes_only_a_line_many_times_longer() {
+    let mut order = Order::default();
+    order.push(1, (0..8).map(|_| work('s', &[], &[1])));
+    order.push(2, (0..2).map(|_| work('e', &[], &[2])));
+    assert_eq!(drain(&mut order), "eessssssss");
+    let mut order = Order::default();
+    order.push(1, (0..8).map(|_| work('s', &[], &[1])));
+    order.push(2, (0..3).map(|_| work('e', &[], &[2])));
+    assert_eq!(drain(&mut order), "sssssssseee");
+}
