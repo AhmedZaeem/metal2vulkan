@@ -387,9 +387,11 @@ impl Log {
     }
 
     /// Empty it for a new command buffer of `level`, keeping its arenas' room.
-    /// Let go of its gates (`dirty_pages.rs`), freed: nothing replays it again.
-    pub(super) fn drop_gates(&mut self) {
-        self.gates.clear();
+    /// Its gates (`dirty_pages.rs`), taken out as it is freed, for the caller to drop once it let
+    /// go of its locks: nothing replays it again, and a gate may hold a buffer's last handle,
+    /// whose going runs the buffer's deallocator.
+    pub(super) fn take_gates(&mut self) -> Vec<Arc<CopyInGate>> {
+        std::mem::take(&mut self.gates)
     }
 
     pub(super) fn clear(&mut self, level: vk::CommandBufferLevel) {

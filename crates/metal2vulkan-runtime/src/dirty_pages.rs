@@ -865,10 +865,12 @@ impl DirtyShadows {
         }
     }
 
-    /// Let go of `commit`'s gates, its command buffer completed: their siblings' images
-    /// (`Sibling`), which the command buffer's object would hold as long as the program keeps it.
-    pub(crate) fn let_go(&self, commit: &mut DirtyCommit) {
-        commit.gates.clear();
+    /// `commit`'s gates, taken out as its command buffer completed: their siblings' images and
+    /// buffers (`Sibling`), which the command buffer's object would hold as long as the program
+    /// keeps it. The caller drops them once it let go of the record's lock, as a gate may hold a
+    /// buffer's last handle, whose going runs its deallocator.
+    pub(crate) fn let_go(&self, commit: &mut DirtyCommit) -> Vec<Arc<CopyInGate>> {
+        std::mem::take(&mut commit.gates)
     }
 
     /// The log kept for `copies`, where its copies in made one.

@@ -4496,7 +4496,10 @@ impl CommandBufferShared {
             if self.device.shared().dirty.any() {
                 let mut dirty = lock(&self.dirty);
                 (self.device.shared().dirty).completed(&mut dirty, result.is_err());
-                (self.device.shared().dirty).let_go(&mut dirty);
+                // Dropped once the record is let go of: a gate may hold a buffer's last handle.
+                let gates = (self.device.shared().dirty).let_go(&mut dirty);
+                drop(dirty);
+                drop(gates);
             }
             match result {
                 Ok(()) => {

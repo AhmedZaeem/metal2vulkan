@@ -151,6 +151,9 @@ pub(super) fn make(level: vk::CommandBufferLevel, replays: &Arc<Replays>) -> Opt
 ///
 /// Nothing records or reads any of them, nor will: their command buffer let go of them.
 pub(super) unsafe fn free(indices: &[u32]) {
+    // What the logs held, and the logs past the kept ones, dropped once the lock is let go of.
+    let mut gates = Vec::new();
+    let mut dropped = Vec::new();
     let mut free = lock(&FREE);
     for &index in indices {
         let log = LOGS[index as usize].swap(std::ptr::null_mut(), Ordering::AcqRel);
@@ -163,10 +166,13 @@ pub(super) unsafe fn free(indices: &[u32]) {
         // do its gates, whose siblings' images (`dirty_pages.rs`) a kept log held until another
         // command buffer took it, however long that was.
         log.disown();
-        log.drop_gates();
-        if free.logs.len() < KEPT_LOGS {
-            free.logs.push(Kept(log));
+        gates.extend(log.take_gates());
+        match free.logs.len() < KEPT_LOGS {
+            true => free.logs.push(Kept(log)),
+            false => dropped.push(log),
         }
     }
     free.indices.extend_from_slice(indices);
+    drop(free);
+    drop((gates, dropped));
 }
