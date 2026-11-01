@@ -49,6 +49,34 @@ pub const REGISTRY: &[EnvVar] = &[
                  share of their colors' pixels and texel bytes; set to anything but empty or 0",
     },
     EnvVar {
+        name: "METAL2VULKAN_HOME_AFTERLIFE_MB",
+        default: "256",
+        effect:
+            "metal2vulkan-runtime: the most MiB of images the process's homes keep after their \
+                 last texture went (texture/homes.rs), every device's together, the longest kept \
+                 going first",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_HOME_AFTERLIFE_MS",
+        default: "250",
+        effect: "metal2vulkan-runtime: how many milliseconds a home stays after its last texture \
+                 went, for a texture made over its bytes again (texture/homes.rs)",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_HOME_AFTERLIFE_HOMES",
+        default: "32",
+        effect:
+            "metal2vulkan-runtime: the most homes a device keeps after their last texture went \
+                 (texture/homes.rs)",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_HOME_AFTERLIFE_FREE_MB",
+        default: "2048",
+        effect: "metal2vulkan-runtime: below this many MiB of device-local memory free in the \
+                 driver's budget (VK_EXT_memory_budget), homes keep nothing after their last \
+                 texture went (texture/homes.rs); 0 never",
+    },
+    EnvVar {
         name: "METAL2VULKAN_LOG_DIRTY_CENSUS",
         default: "unset (off)",
         effect: "metal2vulkan-runtime's diagnostics: once a second, on stderr, the shadows over \
@@ -102,6 +130,37 @@ pub fn lane_validation() -> Option<OsString> {
 pub fn log_pipelines() -> bool {
     std::env::var_os("METAL2VULKAN_LOG_PIPELINES")
         .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// `METAL2VULKAN_HOME_AFTERLIFE_MB`: the MiB the process's homes keep after their last texture
+/// went, where set to a number.
+pub fn home_afterlife_mb() -> Option<u64> {
+    number("METAL2VULKAN_HOME_AFTERLIFE_MB")
+}
+
+/// `METAL2VULKAN_HOME_AFTERLIFE_MS`: the milliseconds a home stays after its last texture went,
+/// where set to a number.
+pub fn home_afterlife_ms() -> Option<u64> {
+    number("METAL2VULKAN_HOME_AFTERLIFE_MS")
+}
+
+/// `METAL2VULKAN_HOME_AFTERLIFE_HOMES`: the most homes a device keeps after their last texture
+/// went, where set to a number.
+pub fn home_afterlife_homes() -> Option<u64> {
+    number("METAL2VULKAN_HOME_AFTERLIFE_HOMES")
+}
+
+/// `METAL2VULKAN_HOME_AFTERLIFE_FREE_MB`: the MiB of device-local memory free below which homes
+/// keep nothing after their last texture went, where set to a number.
+pub fn home_afterlife_free_mb() -> Option<u64> {
+    number("METAL2VULKAN_HOME_AFTERLIFE_FREE_MB")
+}
+
+/// The variable `name` as a whole number, where set to one.
+fn number(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Whether `METAL2VULKAN_LOG_DIRTY_CENSUS` asks the runtime for its census of the copies of

@@ -4433,6 +4433,9 @@ pub struct WorkCounts {
     pub home_afterlives_evicted: u64,
     /// Homes dropped at once as their pages went: their buffer gone, or rebound.
     pub home_afterlives_dropped: u64,
+    /// Copies in that took a home in its afterlife as their base (a sibling's image), sparing a
+    /// copy in of every row, as `home_afterlives_taken` does.
+    pub home_afterlife_bases: u64,
     /// The bytes of the images homes in their afterlife keep now, in the process (every
     /// device's, within the process's 256 MiB).
     pub home_afterlife_bytes: u64,
@@ -5514,6 +5517,7 @@ impl Device {
             home_afterlives_expired: homes[3],
             home_afterlives_evicted: homes[4],
             home_afterlives_dropped: homes[5],
+            home_afterlife_bases: homes[7],
             home_afterlife_bytes: process_homes[0],
             homes_held: process_homes[1],
             homes_orphaned: process_homes[2],

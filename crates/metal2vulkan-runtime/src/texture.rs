@@ -2397,6 +2397,8 @@ impl Device {
             homes::no_home_line(self, &texels, &plan, layout);
         }
         if let Some(key) = home {
+            // The afterlife keeps nothing while the device's memory is short.
+            (self.shared().textures.homes).pressure(|| self.device_memory_headroom());
             if let Some(storage) = self.shared().textures.homes.take(key, &plan, &texels) {
                 self.shared().counts.shadow_home_taken();
                 if device_copy {
@@ -2520,8 +2522,38 @@ impl Device {
 
     /// The homes' tally (`texture/homes.rs`): made, taken, and afterlives kept, taken, expired,
     /// evicted and dropped, and the bytes kept.
-    pub(crate) fn home_tally(&self) -> [u64; 7] {
+    pub(crate) fn home_tally(&self) -> [u64; 8] {
         self.shared().textures.homes.tally()
+    }
+
+    /// The device-local memory free in the driver's budget now (`VK_EXT_memory_budget`, through
+    /// `vkGetPhysicalDeviceMemoryProperties2`): every device-local heap's budget less its usage;
+    /// `None` where the driver gives no budget.
+    pub(crate) fn device_memory_headroom(&self) -> Option<u64> {
+        let shared = self.shared();
+        if shared.instance.api_version.packed() < vk::API_VERSION_1_1 {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: the physical device is the instance's; an unsupported extension's structure in
+        // the chain is left as it was, its zeros read as no budget.
+        unsafe {
+            (shared.instance.raw)
+                .get_physical_device_memory_properties2(shared.physical, &mut properties);
+        }
+        let memory = properties.memory_properties;
+        let heaps = (memory.memory_heaps.iter().zip(budget.heap_budget.iter()))
+            .zip(budget.heap_usage.iter())
+            .take(memory.memory_heap_count as usize)
+            .filter(|((heap, budget), _)| {
+                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) && **budget > 0
+            });
+        let mut free = None;
+        for ((_, budget), usage) in heaps {
+            *free.get_or_insert(0u64) += budget.saturating_sub(*usage);
+        }
+        free
     }
 
     /// Another texture's live home over the same host bytes as `copies`, whose first texel lies

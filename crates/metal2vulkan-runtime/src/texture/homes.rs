@@ -22,9 +22,10 @@
 //!   format (`Device::if_free`), so a texture that renders can take a home a sampled texture
 //!   made, and the other way.
 //! - **Kept a while** (the afterlife). The registry holds a home's image and copies, and its
-//!   texels weakly, so a home's last texture going leaves it: for [`AFTERLIFE_NANOS`], within
-//!   [`AFTERLIFE_BYTES`] of such homes' images in the process (every device's) and
-//!   [`AFTERLIFE_HOMES`] a device, the oldest going first, a texture made
+//!   texels weakly, so a home's last texture going leaves it: for 250 ms, within 256 MiB of such
+//!   homes' images in the process (every device's) and 32 a device, the oldest going first
+//!   ([`bounds`]: `METAL2VULKAN_HOME_AFTERLIFE_MS`, `_MB` and `_HOMES`), and never while the
+//!   device's memory free in the driver's budget is below 2 GiB (`_FREE_MB`), a texture made
 //!   over the same bytes again takes it with its log, hold and watch unbroken, or a copy in over
 //!   them takes its image as a base (`dirty_pages.rs`'s `Sibling`). A program that makes its
 //!   textures over a surface anew each frame copies only the rows that changed. It holds no
@@ -108,6 +109,10 @@ struct Registry {
     swept_at: AtomicU64,
     /// Its share of the process's counts after its last sweep: bytes kept, held, orphaned.
     share: Mutex<[u64; 3]>,
+    /// Whether its device's memory free in the driver's budget was below the floor when last
+    /// asked, and when ([`Registry::pressure`]).
+    pressed: std::sync::atomic::AtomicBool,
+    pressure_at: AtomicU64,
 }
 
 impl Drop for Registry {
@@ -196,8 +201,10 @@ struct AfterlifeTally {
     evicted: AtomicU64,
     dropped: AtomicU64,
     bytes: AtomicU64,
+    /// Copies in that took a home in its afterlife as their base (a sibling's image).
+    based: AtomicU64,
     /// The census's last line: when, and the counts then.
-    censused: Mutex<(u64, [u64; 6])>,
+    censused: Mutex<(u64, [u64; 7])>,
 }
 
 /// How long a home no texture holds stays (the module's **Kept a while**): about a frame and
@@ -208,8 +215,39 @@ const AFTERLIFE_NANOS: u64 = 250_000_000;
 /// registry's together ([`KEPT_BYTES`]), the longest kept going first.
 const AFTERLIFE_BYTES: u64 = 256 << 20;
 
-/// The most homes no texture holds a device's registry keeps.
+/// The most homes no texture holds a device's registry keeps by default.
 const AFTERLIFE_HOMES: usize = 32;
+
+/// The device-local memory free in the driver's budget below which homes keep nothing in their
+/// afterlife by default.
+const AFTERLIFE_FREE: u64 = 2 << 30;
+
+/// How often at most a registry asks the driver for its device's memory budget.
+const PRESSURE_EVERY_NANOS: u64 = 100_000_000;
+
+/// The afterlife's bounds: its age, the process's bytes, a registry's homes, and the free memory
+/// it keeps nothing below (0: no floor).
+struct Bounds {
+    nanos: u64,
+    bytes: u64,
+    homes: usize,
+    free: u64,
+}
+
+/// The afterlife's bounds, read from the environment once: `METAL2VULKAN_HOME_AFTERLIFE_MS`,
+/// `_MB`, `_HOMES` and `_FREE_MB`, each its default where unset.
+fn bounds() -> &'static Bounds {
+    use metal2vulkan::env_vars as env;
+    static BOUNDS: std::sync::OnceLock<Bounds> = std::sync::OnceLock::new();
+    BOUNDS.get_or_init(|| Bounds {
+        nanos: env::home_afterlife_ms().map_or(AFTERLIFE_NANOS, |ms| ms.saturating_mul(1_000_000)),
+        bytes: env::home_afterlife_mb().map_or(AFTERLIFE_BYTES, |mb| mb.saturating_mul(1 << 20)),
+        homes: (env::home_afterlife_homes()).map_or(AFTERLIFE_HOMES, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        }),
+        free: env::home_afterlife_free_mb().map_or(AFTERLIFE_FREE, |mb| mb.saturating_mul(1 << 20)),
+    })
+}
 
 /// How often at most a registry is swept as textures are made and copied in: the reaper sweeps
 /// it every [`REAP_EVERY`] besides, and an import's going or a rebind at once.
@@ -260,13 +298,13 @@ struct Swept {
 
 /// Sweep `entries` at the host nanoseconds `now`: an entry whose pages went goes; one a texture
 /// holds is no orphan; one no texture holds begins its afterlife, and goes past
-/// [`AFTERLIFE_NANOS`] of it; then, past `budget` bytes or `most` orphans, the longest orphaned
-/// go. What goes is moved to `gone`, for the caller to drop once it let go of the registry.
+/// `nanos` of it; then, past `budget` bytes or `most` orphans, the longest orphaned go. What goes
+/// is moved to `gone`, for the caller to drop once it let go of the registry.
 fn sweep<L: Lived>(
     entries: &mut Vec<L>,
     now: u64,
     (gone, kept): (&mut Vec<L>, &mut Vec<L::Kept>),
-    (budget, most): (u64, usize),
+    (nanos, budget, most): (u64, u64, usize),
 ) -> Swept {
     let mut swept = Swept::default();
     let mut at = 0;
@@ -287,7 +325,7 @@ fn sweep<L: Lived>(
                     now
                 }
             };
-            let expired = now.saturating_sub(since) > AFTERLIFE_NANOS;
+            let expired = now.saturating_sub(since) > nanos;
             swept.expired += u64::from(expired);
             expired
         };
@@ -384,6 +422,9 @@ impl Registry {
             // Its buffer too: a copy in's submission reads it again under the scheduler's lock
             // (`dirty_pages.rs`), where its last handle going would run its deallocator.
             let buffer = kept.last().cloned();
+            if home.orphaned.is_some() {
+                self.tally.based.fetch_add(1, Ordering::Relaxed);
+            }
             let keep: Arc<dyn Send + Sync> = Arc::new((Arc::<Image>::clone(&home.image), buffer));
             Some(Sibling {
                 copies: Arc::clone(theirs),
@@ -414,12 +455,27 @@ impl Registry {
 
     /// The tally ([`AfterlifeTally`]): made, taken, and afterlives kept, taken, expired,
     /// evicted and dropped, and the bytes kept.
-    fn tally(&self) -> [u64; 7] {
+    fn tally(&self) -> [u64; 8] {
         let t = &self.tally;
         [
-            &t.made, &t.kept, &t.taken, &t.expired, &t.evicted, &t.dropped, &t.bytes,
+            &t.made, &t.kept, &t.taken, &t.expired, &t.evicted, &t.dropped, &t.bytes, &t.based,
         ]
         .map(|count| count.load(Ordering::Relaxed))
+    }
+
+    /// Ask, at most every [`PRESSURE_EVERY_NANOS`], how much of its device's memory is free in
+    /// the driver's budget (`headroom`, `None` where the driver says not): below the floor, the
+    /// afterlife keeps nothing from the next sweep on.
+    fn pressure(&self, headroom: impl FnOnce() -> Option<u64>) {
+        let floor = bounds().free;
+        let now = crate::gpu_time::host_nanos();
+        let at = self.pressure_at.load(Ordering::Relaxed);
+        if floor == 0 || now.saturating_sub(at) < PRESSURE_EVERY_NANOS {
+            return;
+        }
+        self.pressure_at.store(now, Ordering::Relaxed);
+        let pressed = headroom().is_some_and(|free| free < floor);
+        self.pressed.store(pressed, Ordering::Relaxed);
     }
 
     /// [`sweep`] `homes`, under their lock, into `gone`, counted, and the census's line a second.
@@ -433,8 +489,13 @@ impl Registry {
         let mut share = lock(&self.share);
         // The process's budget, less what the other registries keep.
         let others = KEPT_BYTES.load(Ordering::Relaxed).saturating_sub(share[0]);
-        let budget = AFTERLIFE_BYTES.saturating_sub(others);
-        let swept = sweep(homes, now, (gone, kept), (budget, AFTERLIFE_HOMES));
+        let bounds = bounds();
+        // Under the device's memory pressure, the afterlife keeps nothing.
+        let (budget, most) = match self.pressed.load(Ordering::Relaxed) {
+            true => (0, 0),
+            false => (bounds.bytes.saturating_sub(others), bounds.homes),
+        };
+        let swept = sweep(homes, now, (gone, kept), (bounds.nanos, budget, most));
         let now_share = [swept.bytes, swept.held, swept.orphans];
         for ((count, old), new) in [&KEPT_BYTES, &HELD, &ORPHANED]
             .iter()
@@ -458,7 +519,8 @@ impl Registry {
     }
 
     /// Under the dirty census, once a second: the rates of homes made and taken and of their
-    /// afterlives, and what the afterlife keeps.
+    /// afterlives, among them the hits that spared a copy in of every row (taken again, or a
+    /// copy in's base), what the afterlife keeps, and its bounds.
     fn census_line(&self, now: u64, homes: usize) {
         let t = &self.tally;
         let mut censused = lock(&t.censused);
@@ -467,7 +529,7 @@ impl Registry {
             return;
         }
         let counts = [
-            &t.made, &t.kept, &t.taken, &t.expired, &t.evicted, &t.dropped,
+            &t.made, &t.kept, &t.taken, &t.based, &t.expired, &t.evicted, &t.dropped,
         ]
         .map(|count| count.load(Ordering::Relaxed));
         *censused = (now, counts);
@@ -477,16 +539,27 @@ impl Registry {
         }
         let seconds = now.saturating_sub(at) as f64 / 1e9;
         let rate = |i: usize| (counts[i].saturating_sub(before[i]) as f64 / seconds).round();
+        let bounds = bounds();
         eprintln!(
-            "m2v homes: made {}/s, {homes} live; afterlife kept {}/s, taken {}/s, expired {}/s, \
-             evicted {}/s, dropped as pages went {}/s; {:.1} MiB kept",
+            "m2v homes: made {}/s, {homes} live; afterlife kept {}/s, hits {}/s (taken again \
+             {}/s, a copy in's base {}/s), expired {}/s, evicted {}/s, dropped as pages went \
+             {}/s; {:.1} MiB kept of {} MiB, {} ms, {} a device{}",
             rate(0),
             rate(1),
+            rate(2) + rate(3),
             rate(2),
             rate(3),
             rate(4),
             rate(5),
+            rate(6),
             t.bytes.load(Ordering::Relaxed) as f64 / f64::from(1 << 20),
+            bounds.bytes >> 20,
+            bounds.nanos / 1_000_000,
+            bounds.homes,
+            match self.pressed.load(Ordering::Relaxed) {
+                true => "; none kept, the device's memory short",
+                false => "",
+            },
         );
     }
 
@@ -580,8 +653,13 @@ impl ShadowHomes {
     }
 
     /// [`Registry::tally`].
-    pub(super) fn tally(&self) -> [u64; 7] {
+    pub(super) fn tally(&self) -> [u64; 8] {
         self.inner.tally()
+    }
+
+    /// [`Registry::pressure`].
+    pub(super) fn pressure(&self, headroom: impl FnOnce() -> Option<u64>) {
+        self.inner.pressure(headroom);
     }
 
     /// [`Registry::take`].
@@ -784,7 +862,7 @@ mod tests {
     use super::{revive, sweep, Lived, Swept, AFTERLIFE_BYTES, AFTERLIFE_HOMES, AFTERLIFE_NANOS};
 
     /// The process's whole budget and the registry's count.
-    const ALL: (u64, usize) = (AFTERLIFE_BYTES, AFTERLIFE_HOMES);
+    const ALL: (u64, u64, usize) = (AFTERLIFE_NANOS, AFTERLIFE_BYTES, AFTERLIFE_HOMES);
 
     /// An entry of the afterlife's rules alone.
     #[derive(Debug)]
@@ -890,7 +968,7 @@ mod tests {
                 &mut entries,
                 at,
                 (&mut gone, &mut Vec::new()),
-                (AFTERLIFE_BYTES, usize::MAX),
+                (AFTERLIFE_NANOS, AFTERLIFE_BYTES, usize::MAX),
             );
         }
         let evicted: u64 = gone.len() as u64;
@@ -901,7 +979,7 @@ mod tests {
             &mut entries,
             4,
             (&mut gone, &mut Vec::new()),
-            (AFTERLIFE_BYTES, usize::MAX),
+            (AFTERLIFE_NANOS, AFTERLIFE_BYTES, usize::MAX),
         );
         assert_eq!(swept.bytes, 2 * third);
     }
@@ -919,7 +997,7 @@ mod tests {
             &mut entries,
             1_000,
             (&mut gone, &mut Vec::new()),
-            (10, AFTERLIFE_HOMES),
+            (AFTERLIFE_NANOS, 10, AFTERLIFE_HOMES),
         );
         assert_eq!(swept.bytes, 8, "within its share");
         assert_eq!(swept.evicted, 2);
