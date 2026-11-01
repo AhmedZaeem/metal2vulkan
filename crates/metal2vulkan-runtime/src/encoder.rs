@@ -1609,7 +1609,8 @@ impl EncoderCore {
             crate::dirty_pages::BackKind::Flush => shadows.deferred_keep(&copy.copies)?,
             crate::dirty_pages::BackKind::End => {
                 let image = device.home_image(&copy.copies)?;
-                Arc::new((image, copy.copies.rebound_buffer()?))
+                // The buffer over the program's memory goes on the dropper thread (`later.rs`).
+                Arc::new(crate::later::Later::new((image, copy.copies.rebound_buffer()?)))
             }
         };
         let mut commit = self.open.command_buffer.dirty();

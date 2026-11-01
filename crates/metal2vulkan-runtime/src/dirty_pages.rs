@@ -592,9 +592,16 @@ const IDLE_SWEEP_NANOS: u64 = 50_000_000;
 
 impl Drop for ShadowLog {
     fn drop(&mut self) {
-        let watched = self.watch.get_mut().map_or(true, |watch| watch.is_some());
-        if watched {
+        let watch = match self.watch.get_mut() {
+            Ok(watch) => watch.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if watch.is_some() {
             (self.tally.watched_bytes).fetch_sub(self.bytes(), Ordering::Relaxed);
+        }
+        // A watch's drop is the consumer's code, and a log goes where its logs' lock is held.
+        if let Some(watch) = watch {
+            crate::later::drop_later(watch);
         }
     }
 }
@@ -847,7 +854,7 @@ impl DirtyShadows {
         if let Some(at) = kept {
             let log = Arc::clone(&logs[at]);
             drop(logs);
-            drop(idle);
+            crate::later::drop_later(idle);
             print_census(&census);
             log.used(now);
             return Some(log);
@@ -874,7 +881,7 @@ impl DirtyShadows {
         logs.push(Arc::clone(&log));
         self.any.store(true, Ordering::Release);
         drop(logs);
-        drop(idle);
+        crate::later::drop_later(idle);
         print_census(&census);
         Some(log)
     }

@@ -184,7 +184,9 @@ impl Registry {
             self.reaped.store(false, Ordering::Relaxed);
         }
         drop(homes);
-        drop((gone, kept));
+        drop(gone);
+        // A buffer looked at may be its last handle (`later.rs`).
+        crate::later::drop_later(kept);
         again
     }
 }
@@ -425,14 +427,19 @@ impl Registry {
             if home.orphaned.is_some() {
                 self.tally.based.fetch_add(1, Ordering::Relaxed);
             }
-            let keep: Arc<dyn Send + Sync> = Arc::new((Arc::<Image>::clone(&home.image), buffer));
+            let keep: Arc<dyn Send + Sync> = Arc::new(crate::later::Later::new((
+                Arc::<Image>::clone(&home.image),
+                buffer,
+            )));
             Some(Sibling {
                 copies: Arc::clone(theirs),
                 _keep: keep,
             })
         });
         drop(homes);
-        drop((gone, kept));
+        drop(gone);
+        // A buffer looked at may be its last handle (`later.rs`).
+        crate::later::drop_later(kept);
         sibling
     }
 
@@ -450,7 +457,9 @@ impl Registry {
         };
         self.swept(&mut homes, (&mut gone, &mut kept));
         drop(homes);
-        drop((gone, kept));
+        drop(gone);
+        // A buffer looked at may be its last handle (`later.rs`).
+        crate::later::drop_later(kept);
     }
 
     /// The tally ([`AfterlifeTally`]): made, taken, and afterlives kept, taken, expired,
@@ -612,7 +621,9 @@ impl Registry {
             })
             .next();
         drop(homes);
-        drop((gone, kept));
+        drop(gone);
+        // A buffer looked at may be its last handle (`later.rs`).
+        crate::later::drop_later(kept);
         taken
     }
 
@@ -653,7 +664,9 @@ impl Registry {
         }
         let reaped = !homes.is_empty() && !self.reaped.swap(true, Ordering::Relaxed);
         drop(homes);
-        drop((gone, kept));
+        drop(gone);
+        // A buffer looked at may be its last handle (`later.rs`).
+        crate::later::drop_later(kept);
         reaped
     }
 }
