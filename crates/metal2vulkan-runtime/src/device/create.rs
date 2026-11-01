@@ -91,6 +91,14 @@ pub struct DeviceOptions {
     /// (window-system extensions, for a consumer whose windows present where the device can).
     /// One also in `device_extensions` is that list's. Metal has no such setting.
     pub optional_device_extensions: Vec<CString>,
+    /// Make one queue of the device's optical-flow family (`VK_QUEUE_OPTICAL_FLOW_BIT_NV`) for
+    /// the consumer, enabling `VK_NV_optical_flow` and its `opticalFlow` (and below Vulkan 1.3 the
+    /// two extensions it requires), where the device lists them, has the feature and has such a
+    /// family with a queue to spare; elsewhere the device is made without them.
+    /// [`Device::with_optical_flow_queue`](crate::Device::with_optical_flow_queue) lends the
+    /// queue. The runtime records no optical-flow work and submits nothing to it; its own queues
+    /// and images' queue families are as without it. Off by default. Metal has no such setting.
+    pub optical_flow: bool,
     /// Features of the recommended enables a created device leaves disabled (the robustness
     /// features, for a run of the in-shader containment encoding, for example). The compile
     /// device is made from what is enabled, so it compiles for that. Withholding a feature another
@@ -1082,6 +1090,69 @@ pub(crate) fn linear_color_attachment(
         && supported()
 }
 
+/// The family of the optical-flow queue a device of version `api` (its own, capped by the
+/// instance's) listing `listed`, of `families`, makes for the consumer
+/// (`DeviceOptions::optical_flow`): the first that does optical-flow work, where the device lists
+/// `VK_NV_optical_flow` and what it requires, `VK_KHR_format_feature_flags2` and
+/// `VK_KHR_synchronization2` or Vulkan 1.3, where they are core, and has `opticalFlow`
+/// (`supported`, asked only then).
+pub(crate) fn optical_flow_family(
+    api: ApiVersion,
+    listed: &BTreeSet<CString>,
+    families: &[vk::QueueFamilyProperties],
+    supported: impl FnOnce() -> bool,
+) -> Option<u32> {
+    let requires = [c"VK_KHR_format_feature_flags2", c"VK_KHR_synchronization2"];
+    let family = families.iter().position(|family| {
+        family.queue_count > 0 && family.queue_flags.contains(vk::QueueFlags::OPTICAL_FLOW_NV)
+    })?;
+    ((api >= ApiVersion::V1_3 || requires.iter().all(|name| listed.contains(*name)))
+        && listed.contains(ash::nv::optical_flow::NAME)
+        && supported())
+    .then_some(family as u32)
+}
+
+/// Whether `physical` has `opticalFlow`.
+///
+/// # Safety
+///
+/// `physical` was enumerated from `instance`, made at Vulkan 1.1 or later, and lists
+/// `VK_NV_optical_flow`.
+unsafe fn optical_flow_supported(instance: &InstanceShared, physical: vk::PhysicalDevice) -> bool {
+    let mut flow = vk::PhysicalDeviceOpticalFlowFeaturesNV::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut flow);
+    // SAFETY: the caller's contract; the chain lives for the call.
+    unsafe {
+        instance
+            .raw
+            .get_physical_device_features2(physical, &mut features)
+    };
+    flow.optical_flow == vk::TRUE
+}
+
+/// One more queue of `family` beside `taken`'s (each family the device makes queues of, and how
+/// many), which then counts it: its family and index there. `None` where `families` gives the
+/// family no queue to spare.
+pub(crate) fn spare_queue(
+    taken: &mut Vec<(u32, usize)>,
+    family: u32,
+    families: &[vk::QueueFamilyProperties],
+) -> Option<(u32, u32)> {
+    let count = families.get(family as usize)?.queue_count as usize;
+    match taken.iter_mut().find(|(at, _)| *at == family) {
+        Some((_, made)) if *made < count => {
+            *made += 1;
+            Some((family, (*made - 1) as u32))
+        }
+        Some(_) => None,
+        None if count > 0 => {
+            taken.push((family, 1));
+            Some((family, 0))
+        }
+        None => None,
+    }
+}
+
 /// Whether `physical` has `linearColorAttachment`.
 ///
 /// # Safety
@@ -1363,6 +1434,18 @@ fn create_on(
     if linear_color_attachment {
         enables.enable_linear_color_attachment(crate::enables::linear_color_attachment_names(api));
     }
+    // The consumer's optical-flow queue, where the options ask for it and the device has what it
+    // needs (`DeviceOptions::optical_flow`).
+    let optical_flow = options
+        .optical_flow
+        .then(|| {
+            optical_flow_family(api, &listed, &families, || {
+                // SAFETY: `physical` was enumerated from the instance, made at Vulkan 1.2, and
+                // lists the extension.
+                unsafe { optical_flow_supported(instance, physical) }
+            })
+        })
+        .flatten();
     // The runtime's own need, outside the vocabulary, where the device lists the extensions and
     // links libraries fast: its render pipelines are linked from libraries of their parts
     // (`pipeline/libraries.rs`).
@@ -1424,6 +1507,11 @@ fn create_on(
             None => taken.push((family, 1)),
         }
     }
+    // And the consumer's optical-flow queue, the last of its family; the extension goes with it.
+    let optical_flow = optical_flow.and_then(|family| spare_queue(&mut taken, family, &families));
+    if optical_flow.is_some() {
+        enables.enable_optical_flow(crate::enables::optical_flow_names(api));
+    }
     // One priority per queue of the family the plan takes most of, so the slice each create info
     // names is always within it: the round robin alone takes up to `ROUND_ROBIN_CEILING` of one
     // family, and presenting `PRESENT_QUEUES` more.
@@ -1481,6 +1569,7 @@ fn create_on(
         graphics_pipeline_library,
         ycbcr_conversion,
         ycbcr_444,
+        optical_flow,
         creation_feedback: creation_feedback || feedback_asked,
         dma_buf: dma_buf.is_some(),
         dma_buf_images: dma_buf_images.is_some(),
@@ -1590,6 +1679,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         instance_extensions,
         device_extensions,
         optional_device_extensions,
+        optical_flow,
         withheld_features,
         withheld_extensions,
         messages: _,
@@ -1611,6 +1701,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         && *instance_extensions == b.instance_extensions
         && *device_extensions == b.device_extensions
         && *optional_device_extensions == b.optional_device_extensions
+        && *optical_flow == b.optical_flow
         && *withheld_features == b.withheld_features
         && *withheld_extensions == b.withheld_extensions
         && *loader == b.loader

@@ -75,6 +75,34 @@ impl Device {
             queue_families: &shared.queue_families,
         }
     }
+
+    /// No Metal counterpart: `f`'s answer, given the device's optical-flow queue and its family,
+    /// where the device made one (`DeviceOptions::optical_flow`): the first queue family that
+    /// does optical-flow work, with `VK_NV_optical_flow` and its `opticalFlow` enabled. `None`
+    /// elsewhere, `f` not called. The queue is held for `f`'s call, which is its external
+    /// synchronization: the caller submits to it, and calls what submits to it (NVIDIA's optical
+    /// flow library's executes), only inside `f`.
+    ///
+    /// The runtime submits nothing to this queue and records no optical-flow work. Its own
+    /// buffers and images are concurrent only among [`DeviceHandles::queue_families`], which this
+    /// family is not, so work here reads and writes images the caller made, concurrent among both
+    /// families or handed between them.
+    ///
+    /// # Safety
+    ///
+    /// The caller does not keep the queue past `f`. Its work on the queue uses only objects it
+    /// made, or of the runtime's that it keeps alive until that work completes: the runtime
+    /// neither waits for work there before it frees memory nor orders it with its own.
+    pub unsafe fn with_optical_flow_queue<R>(
+        &self,
+        f: impl FnOnce(vk::Queue, u32) -> R,
+    ) -> Option<R> {
+        let (queue, family) = self.shared().optical_flow.as_ref()?;
+        let queue = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(f(*queue, *family))
+    }
 }
 
 impl Device {

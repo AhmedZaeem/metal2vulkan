@@ -1,6 +1,6 @@
 use crate::enables::{
-    host_image_copy_names, linear_color_attachment_names, names_of, Enables, Promotion, CORE_1_3,
-    MEMBERS,
+    host_image_copy_names, linear_color_attachment_names, names_of, optical_flow_names, Enables,
+    Promotion, CORE_1_3, MEMBERS,
 };
 use crate::error::{Error, RuntimeGap};
 use ash::vk;
@@ -416,6 +416,59 @@ fn host_image_copy_is_enabled_in_its_own_structure() {
         let names: Vec<CString> = names.iter().map(|&name| name.to_owned()).collect();
         assert_eq!(read(&mut enables), (Some(vk::TRUE), names), "{api:?}");
     }
+}
+
+/// The consumer's `opticalFlow` (`DeviceOptions::optical_flow`) is set in its own structure,
+/// chained into the create info only once enabled, with `VK_NV_optical_flow` and, below Vulkan
+/// 1.3, the two extensions it requires, each once.
+#[test]
+fn optical_flow_is_enabled_in_its_own_structure() {
+    let read = |enables: &mut Enables| {
+        enables.with_create_info(&[], |info| {
+            let mut member = None;
+            let mut next = info.p_next.cast::<vk::BaseInStructure>();
+            while !next.is_null() {
+                // SAFETY: every structure of the chain lives for the call, and each begins with
+                // `sType` and `pNext`.
+                let base = unsafe { &*next };
+                if base.s_type
+                    == <vk::PhysicalDeviceOpticalFlowFeaturesNV as vk::TaggedStructure>::STRUCTURE_TYPE
+                {
+                    // SAFETY: a structure of this type is the optical flow features'.
+                    let flow = unsafe { &*next.cast::<vk::PhysicalDeviceOpticalFlowFeaturesNV>() };
+                    member = Some(flow.optical_flow);
+                }
+                next = base.p_next;
+            }
+            let names: Vec<CString> = (0..info.enabled_extension_count as usize)
+                // SAFETY: the create info's names are its count of live C strings.
+                .map(|i| unsafe { CStr::from_ptr(*info.pp_enabled_extension_names.add(i)) })
+                .map(CStr::to_owned)
+                .collect();
+            (member, names)
+        })
+    };
+    let api = ApiVersion::V1_3;
+    let mut enables = Enables::of(&EnableSet::new(), api, &BTreeSet::new(), &[]).unwrap();
+    assert_eq!(read(&mut enables), (None, Vec::new()));
+    enables.enable_optical_flow(optical_flow_names(api));
+    let names = vec![c"VK_NV_optical_flow".to_owned()];
+    assert_eq!(read(&mut enables), (Some(vk::TRUE), names));
+    // Below Vulkan 1.3, with the two it requires, once beside linear color attachment's.
+    let api = ApiVersion::V1_2;
+    let mut enables = Enables::of(&EnableSet::new(), api, &BTreeSet::new(), &[]).unwrap();
+    enables.enable_linear_color_attachment(linear_color_attachment_names(api));
+    enables.enable_optical_flow(optical_flow_names(api));
+    let names: Vec<CString> = [
+        c"VK_NV_linear_color_attachment",
+        c"VK_KHR_format_feature_flags2",
+        c"VK_NV_optical_flow",
+        c"VK_KHR_synchronization2",
+    ]
+    .iter()
+    .map(|&name| name.to_owned())
+    .collect();
+    assert_eq!(read(&mut enables), (Some(vk::TRUE), names));
 }
 
 /// The runtime's own `linearColorAttachment` is set in its own structure, chained into the create

@@ -289,6 +289,7 @@ impl Device {
             // Metal's arithmetic.
             ycbcr_conversion: false,
             ycbcr_444: false,
+            optical_flow: None,
             sparse_features: raw.sparse_features.features(),
             memory_reads,
             owned: false,

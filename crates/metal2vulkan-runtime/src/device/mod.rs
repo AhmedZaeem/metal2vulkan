@@ -289,6 +289,9 @@ pub(super) struct DeviceShared {
     bound_at: Mutex<Option<(vk::Semaphore, u64)>>,
     /// The queue reserved for staging copies, where the device has one (`staging.rs`).
     staging: Option<staging::StagingQueue>,
+    /// The consumer's optical-flow queue and its family, where the device made one
+    /// (`Device::with_optical_flow_queue`): the lock is the queue's external synchronization.
+    pub(crate) optical_flow: Option<(Mutex<vk::Queue>, u32)>,
     pub(super) scheduler: Scheduler,
     /// The scheduler's nudge, a timeline semaphore its wakers signal where its thread waits for
     /// the GPU (`scheduler/mod.rs`): made on every device, used where the driver's wait for any
@@ -1247,6 +1250,10 @@ pub(super) struct Parts {
     /// It takes the two-plane 4:4:4 formats with that conversion: Vulkan 1.3, or
     /// `VK_EXT_ycbcr_2plane_444_formats` enabled with its feature (`create.rs`).
     pub(super) ycbcr_444: bool,
+    /// The queue of the optical-flow family it made for the consumer, its family and index there
+    /// (`DeviceOptions::optical_flow`; `create.rs`), outside `queues`: `None` for an adopted
+    /// device, or where the options or the device have none.
+    pub(super) optical_flow: Option<(u32, u32)>,
     /// It enables `VK_EXT_pipeline_creation_feedback` (`create.rs`), outside `enabled`'s
     /// vocabulary, wherever listed: each making of a program's pipeline reads whether its cache
     /// held the pipeline (`shader_cache/mod.rs`).
@@ -1303,6 +1310,7 @@ impl Device {
             graphics_pipeline_library,
             ycbcr_conversion,
             ycbcr_444,
+            optical_flow: optical_flow_place,
             creation_feedback,
             dma_buf,
             dma_buf_images,
@@ -1426,6 +1434,14 @@ impl Device {
                 let queue = raw.get_device_queue(family, index);
                 staging::StagingQueue::new(family, flags_of(family), queue, &queue_families)
             }
+        });
+        let optical_flow = optical_flow_place.map(|(family, index)| {
+            // SAFETY: as for the staging queue above.
+            let queue = unsafe {
+                loader_word.restore();
+                raw.get_device_queue(family, index)
+            };
+            (Mutex::new(queue), family)
         });
         let family = (families.get(queue_family as usize).copied()).unwrap_or_default();
         let timestamp_bits = family.timestamp_valid_bits;
@@ -1875,6 +1891,7 @@ impl Device {
             by_ends,
             bound_at: Mutex::new(None),
             staging,
+            optical_flow,
             scheduler,
             nudge,
             completion,

@@ -132,6 +132,7 @@ Vulkan-side choices Metal has no counterpart for:
 | `layers`, `layer_settings` | Instance layers, in order, and their settings. |
 | `instance_extensions`, `device_extensions` | Extensions beyond those the runtime enables (a swapchain, for example). |
 | `optional_device_extensions` | Device extensions each device enables only where it can (it lists one, the instance has what it requires, and the device has its features), never refused for one; `Device::enables_extension` says which. |
+| `optical_flow` | One queue of the device's optical-flow family for the consumer, with `VK_NV_optical_flow` and its `opticalFlow` enabled, where the device has them; `Device::with_optical_flow_queue` lends it. The runtime submits nothing there. Off by default. |
 | `instance_api_version` | The instance's `apiVersion` (1.2 when unset); a version outside 1.2 to the loader's is refused, never clamped. |
 | `withheld_features`, `withheld_extensions`, `withhold_generated_commands`, `withhold_view_reinterpretation` | Parts of the recommended enables to leave off; the device then compiles for what is enabled. |
 | `messages` | A `MessageSink` for the validation layer's messages and the runtime's notices; without one, notices go to stderr. `MessageSink::with_least_severity` skips messages below a severity (never a degrade notice), and the runtime then formats none of its own lines it would skip. |
@@ -165,6 +166,8 @@ the runtime made.
 
 - `Device::raw()` gives the entry, instance, physical device, `ash::Device` and queue family.
   `CommandQueue::with_vk_queue` lends a queue's `VkQueue` under the runtime's lock.
+  `Device::with_optical_flow_queue` lends the optical-flow queue `DeviceOptions::optical_flow`
+  made, under its own lock: the caller's work there uses images it made.
 - `Texture::vk_image`, `Buffer::vk_buffer` and `SharedEvent::vk_semaphore` give an object's handle.
   A texture over a buffer's bytes that aliases them gives a linear image (the same one for textures
   of one image over the same bytes of one import of host pages, which share it), which over a

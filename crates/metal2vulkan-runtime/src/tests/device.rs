@@ -138,7 +138,8 @@ fn a_physical_device_s_identity_carries_the_bus_address_the_device_answers() {
 use crate::device::create::{
     default_loaders, dma_buf_image_names, dma_buf_names, drops_layers, enable_set, host_image_copy,
     instance_version, layer_settings, layers_dropped, linear_color_attachment, open_loader,
-    queue_plan, setting_values, timeline_difference, QueuePlan, LAYERS_DROPPED,
+    optical_flow_family, queue_plan, setting_values, spare_queue, timeline_difference, QueuePlan,
+    LAYERS_DROPPED,
 };
 use crate::enables::host_image_copy_names;
 use crate::{DeviceOptions, Error, InstanceApiVersion, LayerSetting, LayerSettingValue};
@@ -639,6 +640,81 @@ fn host_image_copy_is_enabled_wherever_the_device_has_it() {
     assert!(!host_image_copy(names, &short, || panic!(
         "asked without the extensions"
     )));
+}
+
+/// The consumer's optical-flow queue (`DeviceOptions::optical_flow`) is made of the first family
+/// that does optical-flow work, where the device lists `VK_NV_optical_flow` with what it requires
+/// (Vulkan 1.3, or below it `VK_KHR_format_feature_flags2` and `VK_KHR_synchronization2`) and has
+/// `opticalFlow`, asked only then; it is the last queue of its family, one the family spares.
+#[test]
+fn the_optical_flow_queue_is_made_where_the_device_has_it() {
+    use std::cell::Cell;
+    let family = |flags: vk::QueueFlags, count: u32| vk::QueueFamilyProperties {
+        queue_flags: flags,
+        queue_count: count,
+        ..Default::default()
+    };
+    let all = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+    let transfer = vk::QueueFlags::TRANSFER;
+    // NVIDIA's shape: optical flow is the sixth family's, of one queue.
+    let nvidia = [
+        family(all, 16),
+        family(transfer, 2),
+        family(all & !vk::QueueFlags::GRAPHICS, 8),
+        family(transfer | vk::QueueFlags::VIDEO_DECODE_KHR, 1),
+        family(transfer | vk::QueueFlags::VIDEO_ENCODE_KHR, 1),
+        family(transfer | vk::QueueFlags::OPTICAL_FLOW_NV, 1),
+    ];
+    let listed: BTreeSet<CString> = [c"VK_NV_optical_flow".to_owned()].into();
+    let asked = Cell::new(false);
+    let at_1_3 = optical_flow_family(ApiVersion::V1_3, &listed, &nvidia, || {
+        asked.set(true);
+        true
+    });
+    assert_eq!((at_1_3, asked.get()), (Some(5), true));
+    assert_eq!(
+        optical_flow_family(ApiVersion::V1_3, &listed, &nvidia, || false),
+        None,
+        "made without the feature"
+    );
+    assert_eq!(
+        optical_flow_family(ApiVersion::V1_2, &listed, &nvidia, || panic!(
+            "asked below Vulkan 1.3 without the extensions it requires"
+        )),
+        None
+    );
+    let mut required = listed.clone();
+    required.insert(c"VK_KHR_format_feature_flags2".to_owned());
+    required.insert(c"VK_KHR_synchronization2".to_owned());
+    assert_eq!(
+        optical_flow_family(ApiVersion::V1_2, &required, &nvidia, || true),
+        Some(5)
+    );
+    assert_eq!(
+        optical_flow_family(ApiVersion::V1_3, &BTreeSet::new(), &nvidia, || panic!(
+            "asked without the extension"
+        )),
+        None
+    );
+    assert_eq!(
+        optical_flow_family(ApiVersion::V1_3, &listed, &nvidia[..5], || panic!(
+            "asked without an optical-flow family"
+        )),
+        None
+    );
+    // The queue: a family not yet taken gives its first; one the plan takes gives its next, while
+    // it has one to spare.
+    let mut taken = vec![(0, 16), (1, 1)];
+    assert_eq!(spare_queue(&mut taken, 5, &nvidia), Some((5, 0)));
+    assert_eq!(taken, vec![(0, 16), (1, 1), (5, 1)]);
+    assert_eq!(
+        spare_queue(&mut taken, 5, &nvidia),
+        None,
+        "the family's one queue is taken"
+    );
+    assert_eq!(spare_queue(&mut taken, 1, &nvidia), Some((1, 1)));
+    assert_eq!(taken, vec![(0, 16), (1, 2), (5, 1)]);
+    assert_eq!(spare_queue(&mut taken, 9, &nvidia), None, "no such family");
 }
 
 /// The runtime enables `VK_NV_linear_color_attachment` exactly where the device lists it with

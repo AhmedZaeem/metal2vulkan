@@ -322,6 +322,25 @@ pub(super) fn linear_color_attachment_names(api: ApiVersion) -> &'static [&'stat
     }
 }
 
+/// The names of `VK_NV_optical_flow` and of the extensions it requires below Vulkan 1.3, where
+/// they are core (the registry's `depends`: `VK_KHR_format_feature_flags2` and
+/// `VK_KHR_synchronization2`, or Vulkan 1.3).
+const OPTICAL_FLOW: [&CStr; 3] = [
+    ash::nv::optical_flow::NAME,
+    c"VK_KHR_format_feature_flags2",
+    c"VK_KHR_synchronization2",
+];
+
+/// The extensions a device of version `api` enables with `opticalFlow`: the extension, and below
+/// Vulkan 1.3 the two it requires. The runtime's instance is at Vulkan 1.2 unless the consumer
+/// asks another (`DeviceOptions::instance_api_version`), which caps every device's.
+pub(super) fn optical_flow_names(api: ApiVersion) -> &'static [&'static CStr] {
+    match api >= ApiVersion::V1_3 {
+        true => &OPTICAL_FLOW[..1],
+        false => &OPTICAL_FLOW,
+    }
+}
+
 /// One feature structure the runtime can chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Structure {
@@ -399,6 +418,9 @@ pub(super) enum Structure {
     /// `VkPhysicalDeviceLinearColorAttachmentFeaturesNV`, outside the vocabulary: linked only by
     /// [`Enables::enable_linear_color_attachment`].
     LinearColorAttachment,
+    /// `VkPhysicalDeviceOpticalFlowFeaturesNV`, outside the vocabulary: linked only by
+    /// [`Enables::enable_optical_flow`].
+    OpticalFlow,
     /// `VkPhysicalDevicePipelineBinaryFeaturesKHR`, outside the vocabulary: linked only by
     /// [`Enables::turn_driver_pipeline_cache_off`].
     PipelineBinary,
@@ -484,6 +506,7 @@ impl Structure {
             | Structure::SwapchainMaintenance1
             | Structure::FifoLatestReady
             | Structure::LinearColorAttachment
+            | Structure::OpticalFlow
             | Structure::PipelineBinary
             | Structure::InternalCacheControl
             | Structure::GraphicsPipelineLibrary
@@ -542,6 +565,7 @@ impl Structure {
             | Structure::SwapchainMaintenance1
             | Structure::FifoLatestReady
             | Structure::LinearColorAttachment
+            | Structure::OpticalFlow
             | Structure::PipelineBinary
             | Structure::InternalCacheControl
             | Structure::GraphicsPipelineLibrary
@@ -605,6 +629,7 @@ struct FeatureChain {
     swapchain_maintenance1: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>,
     fifo_latest_ready: FifoLatestReadyFeatures,
     linear_color_attachment: vk::PhysicalDeviceLinearColorAttachmentFeaturesNV<'static>,
+    optical_flow: vk::PhysicalDeviceOpticalFlowFeaturesNV<'static>,
     pipeline_binary: PipelineBinaryFeatures,
     internal_cache_control: InternalCacheControl,
     graphics_pipeline_library: vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT<'static>,
@@ -1125,6 +1150,7 @@ macro_rules! link_extensions {
             SwapchainMaintenance1 => swapchain_maintenance1,
             FifoLatestReady => fifo_latest_ready,
             LinearColorAttachment => linear_color_attachment,
+            OpticalFlow => optical_flow,
             PipelineBinary => pipeline_binary,
             InternalCacheControl => internal_cache_control,
             GraphicsPipelineLibrary => graphics_pipeline_library,
@@ -1290,6 +1316,18 @@ impl Enables {
     pub(super) fn enable_linear_color_attachment(&mut self, names: &[&CStr]) {
         self.chain.linear_color_attachment.linear_color_attachment = vk::TRUE;
         self.linked.insert(Structure::LinearColorAttachment);
+        for &name in names {
+            self.push_name(name.to_owned());
+        }
+    }
+
+    /// Enables `VK_NV_optical_flow` and its `opticalFlow`, for the consumer's optical-flow queue
+    /// (`DeviceOptions::optical_flow`): the runtime records no optical-flow work itself. `names`
+    /// are the extension's and, below Vulkan 1.3, those of the two it requires
+    /// ([`optical_flow_names`]).
+    pub(super) fn enable_optical_flow(&mut self, names: &[&CStr]) {
+        self.chain.optical_flow.optical_flow = vk::TRUE;
+        self.linked.insert(Structure::OpticalFlow);
         for &name in names {
             self.push_name(name.to_owned());
         }
