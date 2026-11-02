@@ -1,5 +1,17 @@
 # metal2vulkan
 
+> # ⚠️ WARNING: THIS IS AN AI-EDITED FORK ⚠️
+>
+> **This fork of [steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan) was
+> edited with the help of AI coding agents (Claude). Use it at your own discretion and at your
+> own risk.** The 39 commits on top of upstream commit `0dfdbcd59d` were written and tested by AI
+> agents on one machine only: a Dell Precision 7760 with an **NVIDIA RTX A5000 Laptop GPU
+> (16 GB)**, an Intel Xeon W-11955M, 62 GB of RAM and Arch Linux. Nothing here was run on a Mac,
+> on AMD or Intel GPUs, or reviewed by the upstream maintainers. Upstream's own checks were not
+> run on this branch. It exists so that the companion fork
+> [AhmedZaeem/reims-vgpu](https://github.com/AhmedZaeem/reims-vgpu) builds; see its README for
+> what changed and how it was tested.
+
 [![License: GPL-2.0-or-later OR LGPL-3.0-or-later](https://img.shields.io/badge/License-GPL%202.0%20or%20later%20OR%20LGPL%203.0%20or%20later-blue.svg)](LICENSE)
 
 metal2vulkan runs Metal shaders and Metal programs on Vulkan. It reads **Metal AIR** (a metallib,
